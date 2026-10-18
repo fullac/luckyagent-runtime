@@ -26,7 +26,7 @@ require (
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 // indirect
 	github.com/larksuite/oapi-sdk-go/v3 v3.11.0 // indirect
 	github.com/yuin/goldmark v1.3.5 // indirect
-	github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261018032905-4c324046dcd7 // indirect
+	github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261018033818-5198cd311287 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
@@ -65,9 +65,9 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	github.com/ugorji/go/codec v1.3.1 // indirect
 	github.com/yosida95/uritemplate/v3 v3.0.2 // indirect
-	github.com/yurika0211/luckyagent-api v0.2.2-0.20261018033118-007bb650a85a
+	github.com/yurika0211/luckyagent-api v0.2.2-0.20261018034029-0283dc708d25
 	github.com/yurika0211/luckyagent-gateway v0.2.2
-	github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018033117-497b101307f2
+	github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018034029-4bb5255cde2d
 	go.mongodb.org/mongo-driver/v2 v2.5.0 // indirect
 	go.opentelemetry.io/auto/sdk v1.2.1 // indirect
 	go.opentelemetry.io/otel/metric v1.43.0 // indirect
