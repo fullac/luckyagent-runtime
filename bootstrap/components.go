@@ -96,7 +96,12 @@ func Open(cfg *config.Manager, injected *memory.Runtime) (_ *Components, err err
 	if r.Tasks, err = taskstore.NewFileStore(filepath.Join(cfg.HomeDir(), "tasks")); err != nil {
 		return nil, fmt.Errorf("init task store: %w", err)
 	}
-	r.Support.DelegateMgr.SetTaskStore(r.Tasks)
+	if err := r.Support.DelegateMgr.SetTaskStore(r.Tasks); err != nil {
+		return nil, fmt.Errorf("restore delegate tasks: %w", err)
+	}
+	if err := r.Support.DelegateMgr.SetMDPSnapshotPath(filepath.Join(cfg.HomeDir(), "planner", "delegate_mdp.json")); err != nil {
+		return nil, fmt.Errorf("restore delegate planner: %w", err)
+	}
 	if c.Tools.ComputerUse.Enabled {
 		backend, backendErr := computer.NewBackend(c.Tools.ComputerUse.Backend, computer.BackendOptions{ObserveOnly: c.Tools.ComputerUse.Mode == "observe"})
 		if backendErr != nil {
@@ -154,11 +159,13 @@ func Open(cfg *config.Manager, injected *memory.Runtime) (_ *Components, err err
 	r.CollabRegistry.Register(&collab.AgentProfile{
 		ID: "local-agent", Name: "Local Agent", Description: "The primary local agent",
 		Capabilities: []string{"chat", "code", "analysis", "research"}, Status: collab.StatusOnline,
-		Runtime: collab.AgentRuntimeProfile{AgentID: "local-agent", Provider: c.Provider, Model: c.Model,
+		Runtime: collab.AgentRuntimeProfile{AgentID: "local-agent",
 			MaxIterations: c.Agent.MaxIterations, Timeout: time.Duration(c.Agent.TimeoutSeconds) * time.Second, AllowDelegate: false},
 	})
 	r.CollabManager = collab.NewDelegateManager(r.CollabRegistry, nil)
-	r.CollabManager.SetTaskStore(r.Tasks)
+	if err := r.CollabManager.SetTaskStore(r.Tasks); err != nil {
+		return nil, fmt.Errorf("restore collaboration tasks: %w", err)
+	}
 	_ = r.CollabManager.SetMDPSnapshotPath(filepath.Join(cfg.HomeDir(), "planner", "mdp.json"))
 	r.CronStore = cron.NewStore(filepath.Join(cfg.HomeDir(), "memory", "prompts", "mission.md"))
 	if restored, restoreErr := r.Support.AutonomyKit.EnablePersistence(filepath.Join(cfg.HomeDir(), "runtime", "autonomy_queue.json")); restoreErr != nil {
