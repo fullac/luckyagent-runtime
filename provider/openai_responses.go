@@ -48,6 +48,7 @@ type responsesRequest struct {
 	Tools           []responsesTool     `json:"tools,omitempty"`
 	ToolChoice      any                 `json:"tool_choice,omitempty"`
 	Reasoning       *responsesReasoning `json:"reasoning,omitempty"`
+	PromptCacheKey  string              `json:"prompt_cache_key,omitempty"`
 }
 
 type responsesReasoning struct {
@@ -123,6 +124,7 @@ func buildResponsesRequest(cfg Config, messages []Message, opts CallOptions, str
 		MaxOutputTokens: cfg.Limits.MaxTokens,
 		Temperature:     cfg.LlmProvider.Temperature,
 		Stream:          stream,
+		PromptCacheKey:  strings.TrimSpace(cfg.LlmProvider.PromptCacheKey),
 	}
 	if len(opts.Tools) > 0 {
 		req.Tools = toResponsesTools(opts.Tools)
@@ -253,7 +255,7 @@ func toResponsesInputContent(msg Message) (any, error) {
 
 func toResponsesTools(tools []map[string]any) []responsesTool {
 	result := make([]responsesTool, 0, len(tools))
-	for _, tool := range tools {
+	for _, tool := range canonicalizeOpenAITools(tools) {
 		fn, _ := tool["function"].(map[string]any)
 		function := newToolFunction(fn)
 		if function.Name == "" {

@@ -156,6 +156,7 @@ func ToProviderConfig(c *config.Config, modelOverride, apiBaseOverride string) p
 			Protocol:         c.LlmProvider.Protocol,
 			ReasoningSummary: c.LlmProvider.ReasoningSummary,
 			ReasoningEffort:  c.LlmProvider.ReasoningEffort,
+			PromptCacheKey:   c.LlmProvider.PromptCacheKey,
 			Temperature:      c.Temperature,
 		},
 		ExtraHeaders: c.ExtraHeaders,
@@ -345,6 +346,7 @@ func BuildConfiguredProvider(c *config.Config, registry *provider.Registry) (pro
 			Protocol:         c.LlmProvider.Protocol,
 			ReasoningSummary: c.LlmProvider.ReasoningSummary,
 			ReasoningEffort:  c.LlmProvider.ReasoningEffort,
+			PromptCacheKey:   c.LlmProvider.PromptCacheKey,
 		})
 		for _, fb := range c.Fallbacks {
 			fallbackConfigs = append(fallbackConfigs, provider.FallbackConfig{
@@ -355,6 +357,7 @@ func BuildConfiguredProvider(c *config.Config, registry *provider.Registry) (pro
 				Protocol:         fb.Protocol,
 				ReasoningSummary: fb.ReasoningSummary,
 				ReasoningEffort:  fb.ReasoningEffort,
+				PromptCacheKey:   fb.PromptCacheKey,
 			})
 		}
 		chain, err := provider.NewFallbackChain(fallbackConfigs, registry)

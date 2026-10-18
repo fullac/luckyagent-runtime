@@ -46,6 +46,7 @@ type openaiChatRequest struct {
 	ToolChoice          any                    `json:"tool_choice,omitempty"`
 	StreamOptions       *openAIStreamOptions   `json:"stream_options,omitempty"`
 	ReasoningEffort     string                 `json:"reasoning_effort,omitempty"`
+	PromptCacheKey      string                 `json:"prompt_cache_key,omitempty"`
 }
 
 // openAIStreamOptions requests the final usage event from OpenAI-compatible
@@ -555,6 +556,7 @@ func callOpenAI(ctx context.Context, cfg Config, messages []Message, opts CallOp
 		MaxCompletionTokens: cfg.Limits.MaxTokens,
 		Temperature:         cfg.LlmProvider.Temperature,
 		Stream:              false,
+		PromptCacheKey:      strings.TrimSpace(cfg.LlmProvider.PromptCacheKey),
 	}
 	if effort := normalizedReasoningEffort(cfg.LlmProvider.ReasoningEffort); effort != "" {
 		reqBody.ReasoningEffort = effort
@@ -562,15 +564,7 @@ func callOpenAI(ctx context.Context, cfg Config, messages []Message, opts CallOp
 
 	// v0.16.0: 添加 function calling 工具定义
 	if len(opts.Tools) > 0 {
-		tools := make([]openaiTool, 0, len(opts.Tools))
-		for _, t := range opts.Tools {
-			fn, _ := t["function"].(map[string]any)
-			tools = append(tools, openaiTool{
-				Type:     "function",
-				Function: newToolFunction(fn),
-			})
-		}
-		reqBody.Tools = tools
+		reqBody.Tools = buildOpenAITools(opts.Tools)
 		if supportsToolChoice(cfg.LlmProvider.Model) {
 			if opts.ToolChoice != nil {
 				reqBody.ToolChoice = opts.ToolChoice
@@ -836,6 +830,7 @@ func callOpenAIStream(ctx context.Context, cfg Config, messages []Message, opts 
 		Temperature:         cfg.LlmProvider.Temperature,
 		Stream:              true,
 		StreamOptions:       &openAIStreamOptions{IncludeUsage: true},
+		PromptCacheKey:      strings.TrimSpace(cfg.LlmProvider.PromptCacheKey),
 	}
 	if effort := normalizedReasoningEffort(cfg.LlmProvider.ReasoningEffort); effort != "" {
 		reqBody.ReasoningEffort = effort
@@ -843,15 +838,7 @@ func callOpenAIStream(ctx context.Context, cfg Config, messages []Message, opts 
 
 	// v0.16.0: 添加 function calling 工具定义
 	if len(opts.Tools) > 0 {
-		tools := make([]openaiTool, 0, len(opts.Tools))
-		for _, t := range opts.Tools {
-			fn, _ := t["function"].(map[string]any)
-			tools = append(tools, openaiTool{
-				Type:     "function",
-				Function: newToolFunction(fn),
-			})
-		}
-		reqBody.Tools = tools
+		reqBody.Tools = buildOpenAITools(opts.Tools)
 		if supportsToolChoice(cfg.LlmProvider.Model) {
 			if opts.ToolChoice != nil {
 				reqBody.ToolChoice = opts.ToolChoice

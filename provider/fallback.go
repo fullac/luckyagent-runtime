@@ -18,6 +18,7 @@ type FallbackConfig struct {
 	Protocol         string
 	ReasoningSummary string
 	ReasoningEffort  string
+	PromptCacheKey   string
 }
 
 // FallbackChain 实现 Provider 自动降级链
@@ -60,6 +61,7 @@ func NewFallbackChain(configs []FallbackConfig, registry *Registry) (*FallbackCh
 				Protocol:         fc.Protocol,
 				ReasoningSummary: fc.ReasoningSummary,
 				ReasoningEffort:  fc.ReasoningEffort,
+				PromptCacheKey:   fc.PromptCacheKey,
 			},
 		}
 		p, err := registry.Create(name, pCfg)

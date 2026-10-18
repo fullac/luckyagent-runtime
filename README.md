@@ -35,6 +35,12 @@ The public Agent's `NewWithDependencies` consumes these prepared resources.
 Default application startup lives in `luckyagent-app/bootstrap`. Resources stay
 with their creator unless ownership is explicitly transferred.
 
+## Provider options
+
+[Prompt caching request options](docs/prompt-caching.md) describes stable tool
+schemas and the optional `models.endpoints.chat.prompt_cache_key`, including
+the independent per-fallback setting and both OpenAI protocols.
+
 ## Validation
 
 ```bash
