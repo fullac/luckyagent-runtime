@@ -179,6 +179,12 @@ func (cw *ContextWindow) Fit(messages []Message) ([]Message, TrimResult) {
 	default:
 		trimmed = cw.trimLowPriority(messages, availableTokens)
 	}
+	// Alternative API strategies must not expose partial native tool rounds.
+	var complete []Message
+	for _, group := range completeMessageGroups(trimmed) {
+		complete = append(complete, group.messages...)
+	}
+	trimmed = complete
 
 	result.FinalCount = len(trimmed)
 	result.FinalTokens = cw.estimator.EstimateMessages(trimmed)
@@ -288,28 +294,7 @@ func (cw *ContextWindow) trimOldest(messages []Message, maxTokens int) []Message
 
 // trimLowPriority 优先裁剪低优先级消息
 func (cw *ContextWindow) trimLowPriority(messages []Message, maxTokens int) []Message {
-	// 按优先级分组
-	priorityGroups := make(map[MessagePriority][]Message)
-	for _, msg := range messages {
-		priorityGroups[msg.Priority] = append(priorityGroups[msg.Priority], msg)
-	}
-
-	// 按优先级从高到低填充
-	var result []Message
-	remaining := maxTokens
-
-	for _, pri := range []MessagePriority{PriorityCritical, PriorityHigh, PriorityNormal, PriorityLow} {
-		group := priorityGroups[pri]
-		for _, msg := range group {
-			msgTokens := cw.estimator.EstimateMessage(msg)
-			if msgTokens <= remaining {
-				result = append(result, msg)
-				remaining -= msgTokens
-			}
-		}
-	}
-
-	return cw.sortByPriority(result)
+	return cw.fitCompleteGroups(messages, maxTokens)
 }
 
 // trimSlidingWindow 滑动窗口：保留最近 N 条 + critical
