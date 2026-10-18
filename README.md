@@ -35,6 +35,11 @@ The public Agent's `NewWithDependencies` consumes these prepared resources.
 Default application startup lives in `luckyagent-app/bootstrap`. Resources stay
 with their creator unless ownership is explicitly transferred.
 
+`mcpclient.Manager.Configure` lets an application supply a validated declarative
+catalog before explicit activation, including trusted plugin servers. It starts
+no connections and leaves active sessions unchanged; see
+[MCP configuration lifecycle](docs/mcp-lifecycle.md).
+
 ## Validation
 
 ```bash

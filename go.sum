@@ -54,6 +54,8 @@ github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aN
 github.com/gorilla/websocket v1.5.3/go.mod h1:YR8l580nyteQvAITg2hZ9XVh4b55+EU/adAjf1fMHhE=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0 h1:5VipnvEpbqr2gA2VbM+nYVbkIF28c5ZQfqCBQ5g2xfk=
 github.com/grpc-ecosystem/grpc-gateway/v2 v2.29.0/go.mod h1:Hyl3n6Twe1hvtd9XUXDec4pTvgMSEixRuQKPTMH2bNs=
+github.com/jezek/xgb v1.3.1 h1:NQCAEfQyzN+3RjWUSHBuVIxQcy2YfG3/mNvKfs/0rEg=
+github.com/jezek/xgb v1.3.1/go.mod h1:nrhwO0FX/enq75I7Y7G8iN1ubpSGZEiA3v9e9GyRFlk=
 github.com/json-iterator/go v1.1.12 h1:PV8peI4a0ysnczrg+LtxykD8LfKY9ML6u2jnxaEnrnM=
 github.com/json-iterator/go v1.1.12/go.mod h1:e30LSqwooZae/UwlEbR2852Gd8hjQvJoHmT4TnhNGBo=
 github.com/kisielk/errcheck v1.5.0/go.mod h1:pFxgyoBC7bSaBwPgfKdkLd5X25qrDl4LWUI2bnpBCr8=
@@ -122,8 +124,8 @@ github.com/yurika0211/luckyagent-gateway v0.2.2 h1:vq4SyWUh9kk1v+uJmn+H5Nev6r/v5
 github.com/yurika0211/luckyagent-gateway v0.2.2/go.mod h1:zog8ZaOyWKfJmM6MN43G5+ftyvjjxpiY3VsrcDR3+tE=
 github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261018033818-5198cd311287 h1:APGL87SPpD527fCwroz6jeu2h2SCl/9/qh86YlOZXzc=
 github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261018033818-5198cd311287/go.mod h1:2+IqqxdSrq8S3+K7ADbml705RqSsWQMGEOfADJmNSJk=
-github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018034029-4bb5255cde2d h1:iuO3fhYxvv0ec/LNNKdyouvWYVVBoRZCxLdHnm7Ppm4=
-github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018034029-4bb5255cde2d/go.mod h1:Vba2kQqnPtAUOA3qqatIAorraPRC3B407FWUzGQDMus=
+github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018035859-c0b71ab7458f h1:SUeApIxlHnZ2JnYdb3IX99wRiIQzqo0eMCYAieNQXjE=
+github.com/yurika0211/luckyagent-tools v0.2.3-0.20261018035859-c0b71ab7458f/go.mod h1:ijzevreRX2CDU2YgTx9C9SUM+i69aqMLljIPu9Ye7zE=
 go.mongodb.org/mongo-driver/v2 v2.5.0 h1:yXUhImUjjAInNcpTcAlPHiT7bIXhshCTL3jVBkF3xaE=
 go.mongodb.org/mongo-driver/v2 v2.5.0/go.mod h1:yOI9kBsufol30iFsl1slpdq1I0eHPzybRWdyYUs8K/0=
 go.opentelemetry.io/auto/sdk v1.2.1 h1:jXsnJ4Lmnqd11kwkBV2LgLoFMZKizbCi5fNZ/ipaZ64=
