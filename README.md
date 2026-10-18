@@ -46,6 +46,9 @@ no connections and leaves active sessions unchanged; see
 
 ## Provider options
 
+[Context windows](docs/context-window.md) describes the canonical input budget,
+legacy config migration, reply reserve and complete tool-exchange trimming.
+
 [Prompt caching request options](docs/prompt-caching.md) describes stable tool
 schemas and the optional `models.endpoints.chat.prompt_cache_key`, including
 the independent per-fallback setting and both OpenAI protocols.

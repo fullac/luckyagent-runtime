@@ -571,7 +571,7 @@ func InitSupportRuntime(c *config.Config, mem memory.ToolBackend, ragMgr *rag.RA
 	}
 
 	contextWin := contextx.NewContextWindow(contextx.WindowConfig{
-		MaxTokens:            c.MaxTokens,
+		MaxTokens:            ContextTokensFor(c),
 		ReservedTokens:       ReservedTokensFor(c),
 		Strategy:             contextx.TrimLowPriority,
 		SlidingWindowSize:    10,
@@ -589,7 +589,7 @@ func InitSupportRuntime(c *config.Config, mem memory.ToolBackend, ragMgr *rag.RA
 		ToolServices:   toolServices,
 		DelegateMgr:    delegateMgr,
 		ContextWin:     contextWin,
-		ContextEst:     contextx.NewTokenEstimator(c.MaxTokens),
+		ContextEst:     contextx.NewTokenEstimator(ContextTokensFor(c)),
 		Metrics:        metrics.NewMetrics(),
 		MediaProcessor: mediaProcessor,
 		CronEngine:     cronEngine,
@@ -597,25 +597,36 @@ func InitSupportRuntime(c *config.Config, mem memory.ToolBackend, ragMgr *rag.RA
 	}
 }
 
-/**
- * BuildAutonomyRuntimeConfig 构建 Autonomy 运行时配置，包括设置最大迭代次数、超时和自动审批等。
- */
-// ReservedTokensFor 按 context_budget.reserved_ratio 从 max_tokens 里留出回复份额。
-// 缺省比例是 0.25，与改动前的 MaxTokens/4 一致。
-func ReservedTokensFor(c *config.Config) int {
-	if c == nil || c.MaxTokens <= 0 {
-		return 0
+// ContextTokensFor is the shared context limit. max_tokens is a compatibility
+// fallback for configurations constructed without Context.
+func ContextTokensFor(c *config.Config) int {
+	if c != nil {
+		if c.Context.MaxContextTokens > 0 {
+			return c.Context.MaxContextTokens
+		}
+		if c.MaxTokens > 0 {
+			return c.MaxTokens
+		}
 	}
-	ratio := c.ContextBudget.ReservedRatio
+	return 8000
+}
+
+// ReservedTokensFor reserves output space from the same limit as ContextWin.
+func ReservedTokensFor(c *config.Config) int {
+	limit := ContextTokensFor(c)
+	ratio := 0.25
+	if c != nil {
+		ratio = c.ContextBudget.ReservedRatio
+	}
 	if ratio <= 0 || ratio >= 1 {
 		ratio = 0.25
 	}
-	reserved := int(float64(c.MaxTokens) * ratio)
+	reserved := int(float64(limit) * ratio)
 	if reserved < 1 {
 		reserved = 1
 	}
-	if reserved >= c.MaxTokens {
-		reserved = c.MaxTokens / 4
+	if reserved >= limit {
+		reserved = limit / 4
 		if reserved < 1 {
 			reserved = 1
 		}

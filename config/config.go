@@ -320,7 +320,7 @@ type ContextBudgetConfig struct {
 	RAGRatio        float64 `json:"rag_ratio,omitempty"`
 	HistoryRatio    float64 `json:"history_ratio,omitempty"`
 	ToolResultRatio float64 `json:"tool_result_ratio,omitempty"`
-	// ReservedRatio 是 max_tokens 里留给回复的比例，替代写死的 1/4。
+	// ReservedRatio 是统一上下文上限里留给回复的比例，替代写死的 1/4。
 	ReservedRatio   float64 `json:"reserved_ratio,omitempty"`
 	SystemFloor     int     `json:"system_floor,omitempty"`
 	MemoryFloor     int     `json:"memory_floor,omitempty"`
@@ -1204,6 +1204,20 @@ func parseConfigData(data []byte) (*Config, error) {
 	}
 	if err := json.Unmarshal(data, cfg); err != nil {
 		return nil, err
+	}
+	// Older files used max_tokens as their context limit. Preserve it only
+	// when no positive canonical context limit was supplied in the JSON.
+	var contextFields struct {
+		MaxTokens *int `json:"max_tokens"`
+		Context   struct {
+			MaxContextTokens *int `json:"max_context_tokens"`
+		} `json:"context"`
+	}
+	if err := json.Unmarshal(data, &contextFields); err != nil {
+		return nil, err
+	}
+	if contextFields.MaxTokens != nil && *contextFields.MaxTokens > 0 && (contextFields.Context.MaxContextTokens == nil || *contextFields.Context.MaxContextTokens <= 0) {
+		cfg.Context.MaxContextTokens = *contextFields.MaxTokens
 	}
 	if err := validateModelConfig(cfg); err != nil {
 		return nil, err
@@ -2185,6 +2199,7 @@ func (m *Manager) Set(key, value string) error {
 		var n int
 		fmt.Sscanf(value, "%d", &n)
 		m.config.MaxTokens = n
+		m.config.Context.MaxContextTokens = n
 	case "temperature":
 		var f float64
 		fmt.Sscanf(value, "%f", &f)
