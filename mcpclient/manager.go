@@ -34,6 +34,23 @@ func NewManager(config Config, resolve CredentialResolver) *Manager {
 	return &Manager{connections: map[string]*connection{}, configured: config.Clone(), resolve: resolve}
 }
 
+// Configure replaces the declarative startup/reconnect catalog without starting
+// connections or changing active sessions. Callers may add verified plugin
+// servers before the application's explicit Start. The manager owns a copy.
+func (m *Manager) Configure(config Config) error {
+	config = config.Clone()
+	if err := config.Validate(); err != nil {
+		return err
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.closed {
+		return ErrClosed
+	}
+	m.configured = config
+	return nil
+}
+
 // SetPublisher installs the host's catalog adapter. Publication runs under the
 // manager lock so a newly visible handler can only execute against that same
 // connection generation. The callback must not call back into the Manager.
@@ -55,7 +72,9 @@ func (m *Manager) SetPublisher(publish func([]ToolDescriptor) error) error {
 }
 
 func (m *Manager) ConnectConfigured(ctx context.Context, name string) error {
+	m.mu.RLock()
 	cfg, ok := m.configured.Servers[name]
+	m.mu.RUnlock()
 	if !ok {
 		return fmt.Errorf("MCP server %q is not configured", name)
 	}
@@ -65,14 +84,17 @@ func (m *Manager) ConnectConfigured(ctx context.Context, name string) error {
 // Start restores declaratively configured connections. Failures are visible
 // independently in Status and do not discard other successfully loaded servers.
 func (m *Manager) Start(ctx context.Context) error {
-	names := make([]string, 0, len(m.configured.Servers))
-	for name := range m.configured.Servers {
+	m.mu.RLock()
+	configured := m.configured.Clone()
+	m.mu.RUnlock()
+	names := make([]string, 0, len(configured.Servers))
+	for name := range configured.Servers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
 	var errs []error
 	for _, name := range names {
-		if err := m.ConnectConfigured(ctx, name); err != nil {
+		if err := m.Connect(ctx, name, configured.Servers[name]); err != nil {
 			errs = append(errs, err)
 		}
 	}
