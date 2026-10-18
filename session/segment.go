@@ -2,8 +2,11 @@ package session
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -30,7 +33,7 @@ func (s *Session) ensureSegmentDirs() error {
 }
 
 // appendMessagesJSONL appends messages as one JSON object per line.
-func (s *Session) appendMessagesJSONL(messages []provider.Message) error {
+func (s *Session) appendMessagesJSONL(messages []provider.Message) (retErr error) {
 	if len(messages) == 0 {
 		return nil
 	}
@@ -38,11 +41,29 @@ func (s *Session) appendMessagesJSONL(messages []provider.Message) error {
 		return err
 	}
 	path := s.messagesJSONLPath()
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
 		return fmt.Errorf("open messages jsonl: %w", err)
 	}
 	defer f.Close()
+	if err := prepareJSONLAppend(f); err != nil {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	// Save retries the pending in-memory suffix after a failure. Roll back any
+	// complete records written by this attempt so that retry cannot duplicate it.
+	defer func() {
+		if retErr != nil {
+			if err := f.Truncate(info.Size()); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("rollback jsonl append: %w", err))
+			} else if err := f.Sync(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("sync jsonl rollback: %w", err))
+			}
+		}
+	}()
 
 	w := bufio.NewWriter(f)
 	for i := range messages {
@@ -80,8 +101,128 @@ func (s *Session) rewriteMessagesJSONL(messages []provider.Message) error {
 	return utils.WriteFileAtomic(s.messagesJSONLPath(), []byte(b.String()), 0600)
 }
 
-// readAllMessagesJSONL loads every message from the segment jsonl.
+const maxMessageRecordBytes = 8 * 1024 * 1024
+
+// walkMessagesJSONL treats a newline as the commit boundary. Only an incomplete
+// final record without a newline may be skipped after an interrupted append.
+// Readers never change the file; the next successful append repairs that tail.
+func walkMessagesJSONL(r io.Reader, offset int64, lineNo int, visit func(provider.Message, int64, int) error) error {
+	return walkMessagesJSONLMode(r, offset, lineNo, true, visit)
+}
+
+func walkMessagesJSONLMode(r io.Reader, offset int64, lineNo int, allowIncompleteTail bool, visit func(provider.Message, int64, int) error) error {
+	reader := bufio.NewReaderSize(r, 64*1024)
+	for {
+		start := offset
+		var line []byte
+		var readErr error
+		for {
+			part, err := reader.ReadSlice('\n')
+			if len(line)+len(part) > maxMessageRecordBytes {
+				return fmt.Errorf("messages.jsonl line %d exceeds %d bytes", lineNo, maxMessageRecordBytes)
+			}
+			line = append(line, part...)
+			offset += int64(len(part))
+			if err != bufio.ErrBufferFull {
+				readErr = err
+				break
+			}
+		}
+		if readErr != nil && readErr != io.EOF {
+			return fmt.Errorf("read messages.jsonl line %d: %w", lineNo, readErr)
+		}
+		trimmed := bytes.TrimSpace(line)
+		if len(trimmed) > 0 {
+			var msg provider.Message
+			if err := json.Unmarshal(trimmed, &msg); err != nil {
+				if allowIncompleteTail && readErr == io.EOF && incompleteJSONRecord(trimmed) {
+					return nil
+				}
+				return fmt.Errorf("decode messages.jsonl line %d: %w", lineNo, err)
+			}
+			if err := visit(msg, start, lineNo); err != nil {
+				return err
+			}
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		lineNo++
+	}
+}
+
+func incompleteJSONRecord(data []byte) bool {
+	var value json.RawMessage
+	err := json.NewDecoder(bytes.NewReader(data)).Decode(&value)
+	return errors.Is(err, io.ErrUnexpectedEOF)
+}
+
+// prepareJSONLAppend inspects only the last uncommitted line. A complete legacy
+// record without a newline gets a separator; a partial record is truncated to
+// the previous commit boundary before any new records are appended.
+func prepareJSONLAppend(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil || info.Size() == 0 {
+		return err
+	}
+	end := info.Size()
+	last := make([]byte, 1)
+	if _, err := f.ReadAt(last, end-1); err != nil {
+		return err
+	}
+	if last[0] == '\n' {
+		return nil
+	}
+	start := end
+	var tail []byte
+	for start > 0 {
+		size := int64(64 * 1024)
+		if size > start {
+			size = start
+		}
+		start -= size
+		chunk := make([]byte, size)
+		if _, err := f.ReadAt(chunk, start); err != nil {
+			return err
+		}
+		if newline := bytes.LastIndexByte(chunk, '\n'); newline >= 0 {
+			start += int64(newline + 1)
+			tail = append(chunk[newline+1:], tail...)
+			break
+		}
+		tail = append(chunk, tail...)
+		if len(tail) > maxMessageRecordBytes {
+			return fmt.Errorf("messages.jsonl final record exceeds %d bytes", maxMessageRecordBytes)
+		}
+	}
+	trimmed := bytes.TrimSpace(tail)
+	if len(trimmed) > 0 {
+		var msg provider.Message
+		if err := json.Unmarshal(trimmed, &msg); err != nil {
+			if !incompleteJSONRecord(trimmed) {
+				return fmt.Errorf("decode messages.jsonl final record: %w", err)
+			}
+			if err := f.Truncate(start); err != nil {
+				return fmt.Errorf("repair incomplete messages.jsonl tail: %w", err)
+			}
+			return f.Sync()
+		}
+	}
+	_, err = f.Write([]byte{'\n'})
+	return err
+}
+
+// readAllMessagesJSONL loads every committed message from the segment jsonl.
 func readAllMessagesJSONL(path string) ([]provider.Message, error) {
+	return readMessagesJSONLMode(path, true)
+}
+
+// Maintenance must not discard references from unreadable source records.
+func readAllMessagesJSONLStrict(path string) ([]provider.Message, error) {
+	return readMessagesJSONLMode(path, false)
+}
+
+func readMessagesJSONLMode(path string, allowIncompleteTail bool) ([]provider.Message, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -89,25 +230,12 @@ func readAllMessagesJSONL(path string) ([]provider.Message, error) {
 	defer file.Close()
 
 	messages := make([]provider.Message, 0, 256)
-	scanner := bufio.NewScanner(file)
-	// Large tool previews can still be multi-KB; allow up to 8MB per line.
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 8*1024*1024)
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var msg provider.Message
-		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			return nil, fmt.Errorf("decode messages.jsonl line %d: %w", lineNo, err)
-		}
+	err = walkMessagesJSONLMode(file, 0, 1, allowIncompleteTail, func(msg provider.Message, _ int64, _ int) error {
 		messages = append(messages, msg)
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("scan messages.jsonl: %w", err)
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
 	return messages, nil
 }
@@ -126,24 +254,12 @@ func readMessagesJSONLTail(path string, keep int) ([]provider.Message, int, erro
 
 	ring := make([]provider.Message, keep)
 	seen := 0
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 8*1024*1024)
-	lineNo := 0
-	for scanner.Scan() {
-		lineNo++
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-		var msg provider.Message
-		if err := json.Unmarshal([]byte(line), &msg); err != nil {
-			return nil, 0, fmt.Errorf("decode messages.jsonl line %d: %w", lineNo, err)
-		}
+	err = walkMessagesJSONL(file, 0, 1, func(msg provider.Message, _ int64, _ int) error {
 		ring[seen%keep] = msg
 		seen++
-	}
-	if err := scanner.Err(); err != nil {
+		return nil
+	})
+	if err != nil {
 		return nil, 0, err
 	}
 	if seen == 0 {
@@ -171,16 +287,11 @@ func countMessagesJSONL(path string) (int, error) {
 	}
 	defer file.Close()
 	count := 0
-	scanner := bufio.NewScanner(file)
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 8*1024*1024)
-	for scanner.Scan() {
-		if strings.TrimSpace(scanner.Text()) == "" {
-			continue
-		}
+	err = walkMessagesJSONL(file, 0, 1, func(_ provider.Message, _ int64, _ int) error {
 		count++
-	}
-	return count, scanner.Err()
+		return nil
+	})
+	return count, err
 }
 
 func fileByteSize(path string) int64 {

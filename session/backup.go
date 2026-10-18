@@ -14,7 +14,7 @@ import (
 	"github.com/yurika0211/luckyagent-runtime/provider"
 )
 
-const sessionBackupFormatVersion = 1
+const sessionBackupFormatVersion = 2
 
 // BackupInfo describes an immutable pre-compaction session backup.
 type BackupInfo struct {
@@ -39,8 +39,11 @@ type sessionBackup struct {
 	AgentRole         string             `json:"agent_role,omitempty"`
 	AgentSystemPrompt string             `json:"agent_system_prompt,omitempty"`
 	Messages          []provider.Message `json:"messages"`
-	ShellContext      ShellContext       `json:"shell_context"`
-	ContentHash       string             `json:"content_hash"`
+	// Version 2 embeds referenced bodies so a backup survives blob GC or loss
+	// of the live transcript directory. Version 1 remains readable.
+	Blobs        map[string][]byte `json:"blobs,omitempty"`
+	ShellContext ShellContext      `json:"shell_context"`
+	ContentHash  string            `json:"content_hash"`
 }
 
 // CreateBackup writes an immutable, standalone copy of the complete session.
@@ -52,6 +55,11 @@ func (s *Session) CreateBackup(trigger string) (*BackupInfo, error) {
 	}
 	if strings.TrimSpace(trigger) == "" {
 		trigger = "manual"
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return nil, err
 	}
 	if err := s.loadMessages(); err != nil {
 		return nil, fmt.Errorf("create session backup: load messages: %w", err)
@@ -77,6 +85,26 @@ func (s *Session) CreateBackup(trigger string) (*BackupInfo, error) {
 	}
 	dir := filepath.Join(s.dir, ".backups", s.ID)
 	s.mu.RUnlock()
+	for _, msg := range backup.Messages {
+		if msg.BlobHash == "" {
+			continue
+		}
+		body, embedded := backup.Blobs[msg.BlobHash]
+		if !embedded {
+			var err error
+			body, err = s.ReadBlob(msg.BlobHash)
+			if err != nil {
+				return nil, fmt.Errorf("create session backup: read blob %s: %w", msg.BlobHash, err)
+			}
+		}
+		if err := validateBackupBlob(msg, body); err != nil {
+			return nil, fmt.Errorf("create session backup: %w", err)
+		}
+		if backup.Blobs == nil {
+			backup.Blobs = make(map[string][]byte)
+		}
+		backup.Blobs[msg.BlobHash] = body
+	}
 
 	body, err := marshalSessionBackup(backup)
 	if err != nil {
@@ -146,6 +174,11 @@ func (s *Session) RestoreBackup(backupID string) (*BackupInfo, error) {
 	if s == nil {
 		return nil, fmt.Errorf("restore session backup: session is nil")
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return nil, err
+	}
 	backupID = strings.TrimSuffix(strings.TrimSpace(backupID), ".json")
 	if !validBackupID(backupID) {
 		return nil, fmt.Errorf("restore session backup: invalid backup id")
@@ -158,6 +191,11 @@ func (s *Session) RestoreBackup(backupID string) (*BackupInfo, error) {
 	if backup.SessionID != s.ID {
 		return nil, fmt.Errorf("restore session backup: backup belongs to session %s", backup.SessionID)
 	}
+	// Validate and restore bodies before replacing the transcript. A legacy
+	// backup whose referenced body is missing cannot claim a successful restore.
+	if err := s.restoreBackupBlobsLocked(backup); err != nil {
+		return nil, fmt.Errorf("restore session backup: %w", err)
+	}
 
 	s.mu.Lock()
 	s.Title = backup.Title
@@ -169,9 +207,12 @@ func (s *Session) RestoreBackup(backupID string) (*BackupInfo, error) {
 	s.ShellContext = ShellContext{Cwd: backup.ShellContext.Cwd, Env: cloneEnv(backup.ShellContext.Env)}
 	s.messagesLoaded = true
 	s.messageCount = len(s.Messages)
+	s.needsFullRewrite = true
+	s.persistedCount = 0
+	s.invalidatePageCacheLocked()
 	s.mu.Unlock()
 
-	if err := s.Save(); err != nil {
+	if err := s.saveLocked(); err != nil {
 		return nil, fmt.Errorf("restore session backup: save session: %w", err)
 	}
 	return &BackupInfo{
@@ -183,6 +224,59 @@ func (s *Session) RestoreBackup(backupID string) (*BackupInfo, error) {
 		MessageCount: len(backup.Messages),
 		ContentHash:  backup.ContentHash,
 	}, nil
+}
+
+func validateBackupBlob(msg provider.Message, body []byte) error {
+	if len(msg.BlobHash) != sha256.Size*2 || hashBytes(body) != msg.BlobHash {
+		return fmt.Errorf("blob %s content hash mismatch", msg.BlobHash)
+	}
+	if msg.BlobBytes > 0 && len(body) != msg.BlobBytes {
+		return fmt.Errorf("blob %s size mismatch", msg.BlobHash)
+	}
+	return nil
+}
+
+// restoreBackupBlobsLocked requires saveMu, which also excludes GC and appends.
+func (s *Session) restoreBackupBlobsLocked(backup sessionBackup) error {
+	written := false
+	defer func() {
+		if written {
+			s.refreshStorageBytesLocked()
+		}
+	}()
+	for _, msg := range backup.Messages {
+		if msg.BlobHash == "" {
+			continue
+		}
+		body, embedded := backup.Blobs[msg.BlobHash]
+		if !embedded {
+			if backup.FormatVersion >= 2 {
+				return fmt.Errorf("backup is missing embedded blob %s", msg.BlobHash)
+			}
+			var err error
+			body, err = s.ReadBlob(msg.BlobHash)
+			if err != nil {
+				return fmt.Errorf("read legacy backup blob %s: %w", msg.BlobHash, err)
+			}
+		}
+		if err := validateBackupBlob(msg, body); err != nil {
+			return err
+		}
+		if !embedded {
+			continue
+		}
+		if existing, err := s.ReadBlob(msg.BlobHash); err == nil && validateBackupBlob(msg, existing) == nil {
+			continue
+		}
+		if err := os.MkdirAll(s.blobsDir(), 0700); err != nil {
+			return fmt.Errorf("create backup blob directory: %w", err)
+		}
+		if err := writeAtomicPrivateFile(s.blobFilePath(msg.BlobHash), body); err != nil {
+			return fmt.Errorf("restore blob %s: %w", msg.BlobHash, err)
+		}
+		written = true
+	}
+	return nil
 }
 
 func marshalSessionBackup(backup sessionBackup) ([]byte, error) {
@@ -199,7 +293,7 @@ func readSessionBackup(path string) (sessionBackup, error) {
 	if err := json.Unmarshal(data, &backup); err != nil {
 		return sessionBackup{}, fmt.Errorf("decode %s: %w", path, err)
 	}
-	if backup.FormatVersion != sessionBackupFormatVersion {
+	if backup.FormatVersion != 1 && backup.FormatVersion != sessionBackupFormatVersion {
 		return sessionBackup{}, fmt.Errorf("unsupported backup format %d", backup.FormatVersion)
 	}
 	if strings.TrimSpace(backup.ID) == "" || !validBackupID(backup.ID) {

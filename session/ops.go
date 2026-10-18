@@ -56,25 +56,21 @@ func (s *Session) ByteSize() int64 {
 	if s == nil {
 		return 0
 	}
-	s.mu.RLock()
-	format := s.format
-	id := s.ID
-	dir := s.dir
-	s.mu.RUnlock()
-	switch format {
-	case FormatSegmentV1:
-		return segmentStorageBytes(filepath.Join(dir, id))
-	default:
-		return fileByteSize(filepath.Join(dir, id+".md"))
-	}
+	return s.cachedStorageBytes()
 }
 
 // MigrateToSegment forces externalization + segment_v1 rewrite.
 func (s *Session) MigrateToSegment() (MigrateResult, error) {
-	result := MigrateResult{ID: s.ID}
+	result := MigrateResult{}
 	if s == nil {
 		return result, fmt.Errorf("session is nil")
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return result, err
+	}
+	result.ID = s.ID
 	s.mu.RLock()
 	result.FromFormat = s.format
 	if result.FromFormat == "" {
@@ -86,7 +82,7 @@ func (s *Session) MigrateToSegment() (MigrateResult, error) {
 		result.Error = err.Error()
 		return result, err
 	}
-	if err := s.ExternalizeLargeMessages(); err != nil {
+	if err := s.externalizeLargeMessagesLocked(); err != nil {
 		result.Error = err.Error()
 		return result, err
 	}
@@ -101,7 +97,7 @@ func (s *Session) MigrateToSegment() (MigrateResult, error) {
 	if already {
 		// Still rewrite to pick up any newly externalized blobs and drop legacy md.
 	}
-	if err := s.Save(); err != nil {
+	if err := s.saveLocked(); err != nil {
 		result.Error = err.Error()
 		return result, err
 	}
@@ -143,13 +139,18 @@ func (s *Session) Roll(retainTurns int) (RollResult, error) {
 	if s == nil {
 		return result, fmt.Errorf("session is nil")
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return result, err
+	}
 	if retainTurns <= 0 {
 		retainTurns = 12
 	}
 	if err := s.loadMessages(); err != nil {
 		return result, err
 	}
-	if err := s.ExternalizeLargeMessages(); err != nil {
+	if err := s.externalizeLargeMessagesLocked(); err != nil {
 		return result, err
 	}
 
@@ -200,7 +201,7 @@ func (s *Session) Roll(retainTurns int) (RollResult, error) {
 	s.UpdatedAt = time.Now()
 	s.mu.Unlock()
 
-	if err := s.Save(); err != nil {
+	if err := s.saveLocked(); err != nil {
 		return result, err
 	}
 	result.Rolled = true
@@ -242,10 +243,21 @@ func writeMessagesJSONLFile(path string, messages []provider.Message) error {
 
 // GCBlobs deletes unreferenced blob files under the session blobs directory.
 func (s *Session) GCBlobs() (GCResult, error) {
-	result := GCResult{ID: s.ID}
+	result := GCResult{}
 	if s == nil {
 		return result, fmt.Errorf("session is nil")
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return result, err
+	}
+	result.ID = s.ID
+	defer func() {
+		if result.Removed > 0 {
+			s.refreshStorageBytesLocked()
+		}
+	}()
 	if err := s.loadMessages(); err != nil {
 		result.Error = err.Error()
 		return result, err
@@ -268,9 +280,11 @@ func (s *Session) GCBlobs() (GCResult, error) {
 			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".jsonl") {
 				continue
 			}
-			msgs, err := readAllMessagesJSONL(filepath.Join(archiveDir, entry.Name()))
+			msgs, err := readAllMessagesJSONLStrict(filepath.Join(archiveDir, entry.Name()))
 			if err != nil {
-				continue
+				err = fmt.Errorf("read archive references %s: %w", entry.Name(), err)
+				result.Error = err.Error()
+				return result, err
 			}
 			for _, msg := range msgs {
 				if hash := strings.TrimSpace(msg.BlobHash); hash != "" {
@@ -278,6 +292,38 @@ func (s *Session) GCBlobs() (GCResult, error) {
 				}
 			}
 		}
+	} else if !os.IsNotExist(err) {
+		err = fmt.Errorf("read archive directory: %w", err)
+		result.Error = err.Error()
+		return result, err
+	}
+	// Older backups may depend on the live blob directory. New standalone
+	// backups also retain their references until the backup is removed.
+	backupDir := filepath.Join(s.dir, ".backups", s.ID)
+	if entries, err := os.ReadDir(backupDir); err == nil {
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			backup, err := readSessionBackup(filepath.Join(backupDir, entry.Name()))
+			if err == nil && backup.SessionID != s.ID {
+				err = fmt.Errorf("backup belongs to session %s", backup.SessionID)
+			}
+			if err != nil {
+				err = fmt.Errorf("read backup references %s: %w", entry.Name(), err)
+				result.Error = err.Error()
+				return result, err
+			}
+			for _, msg := range backup.Messages {
+				if hash := strings.TrimSpace(msg.BlobHash); hash != "" {
+					referenced[hash] = struct{}{}
+				}
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		err = fmt.Errorf("read backup directory: %w", err)
+		result.Error = err.Error()
+		return result, err
 	}
 	result.Referenced = len(referenced)
 
@@ -301,7 +347,8 @@ func (s *Session) GCBlobs() (GCResult, error) {
 		path := filepath.Join(blobs, name)
 		info, statErr := entry.Info()
 		if removeErr := os.Remove(path); removeErr != nil {
-			continue
+			result.Error = removeErr.Error()
+			return result, fmt.Errorf("remove unreferenced blob %s: %w", name, removeErr)
 		}
 		result.Removed++
 		if statErr == nil {
