@@ -23,6 +23,10 @@ consumers use its public memory ports. The execution kernels and generic tools
 remain in `luckyagent-tools`; API/platform protocols remain in the independent
 API and gateway modules.
 
+[Session storage and recovery](docs/session-storage.md) covers concurrent
+saves, deletion, standalone backups, incomplete JSONL tails, metadata-only
+updates and bounded history pagination.
+
 ## Resource lifecycle
 
 `bootstrap.Open(configManager, optionalMemoryRuntime)` prepares dependencies.

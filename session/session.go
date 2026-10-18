@@ -61,7 +61,9 @@ type CompactTrace struct {
 
 // Session 代表一次对话会话
 type Session struct {
-	mu     sync.RWMutex
+	mu sync.RWMutex
+	// saveMu serializes transcript mutations, persistence and deletion. Acquire
+	// it before loadMu or mu; callers already holding it use the *Locked helpers.
 	saveMu sync.Mutex
 	loadMu sync.Mutex
 	ID     string
@@ -76,6 +78,9 @@ type Session struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	dir               string
+	deleted           bool
+	storageBytes      int64
+	storageBytesValid bool
 	// ShellContext 持久化 shell 环境（跨工具调用保持）
 	ShellContext ShellContext
 
@@ -97,6 +102,7 @@ type Session struct {
 	pageCacheStart int
 	pageCacheTotal int
 	pageCacheValid bool
+	pageIndex      *messagePageIndex
 }
 
 // ShellContext 保存 shell 会话的环境状态
@@ -228,13 +234,14 @@ func (s *Session) Organization() (pinned bool, project string) {
 func NewSession(id, dir string) *Session {
 	now := time.Now()
 	return &Session{
-		ID:             id,
-		Messages:       make([]provider.Message, 0),
-		CreatedAt:      now,
-		UpdatedAt:      now,
-		dir:            dir,
-		format:         FormatSegmentV1,
-		messagesLoaded: true,
+		ID:                id,
+		Messages:          make([]provider.Message, 0),
+		CreatedAt:         now,
+		UpdatedAt:         now,
+		dir:               dir,
+		format:            FormatSegmentV1,
+		messagesLoaded:    true,
+		storageBytesValid: true,
 	}
 }
 
@@ -253,11 +260,26 @@ func (s *Session) Format() string {
 
 // AddProviderMessage 添加完整 provider 消息（保留 tool_calls / tool_call_id 等结构化字段）
 func (s *Session) AddProviderMessage(msg provider.Message) {
+	_ = s.AddProviderMessageWithError(msg)
+}
+
+// AddProviderMessageWithError appends a message after loading durable history.
+// Failed loads, deleted sessions and blob write failures are reported without
+// changing the transcript.
+func (s *Session) AddProviderMessageWithError(msg provider.Message) error {
+	if s == nil {
+		return fmt.Errorf("session is nil")
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return err
+	}
 	// Metadata-only sessions must load the on-disk history before any append.
 	// Treating messagesLoaded=false as an empty slice and then Save() wipes
 	// the file. A load failure must not mark the session loaded.
 	if err := s.loadMessages(); err != nil {
-		return
+		return err
 	}
 
 	if msg.CreatedAt == nil {
@@ -270,14 +292,20 @@ func (s *Session) AddProviderMessage(msg provider.Message) {
 	}
 
 	// Blob I/O outside the session mutex; externalize before appending.
-	_ = s.externalizeLargeContent(&msg)
+	originalBlob := msg.BlobHash
+	if err := s.externalizeLargeContent(&msg); err != nil {
+		return fmt.Errorf("externalize session message: %w", err)
+	}
+	if originalBlob == "" && msg.BlobHash != "" {
+		s.refreshStorageBytesLocked()
+	}
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// loadMessages may have failed to observe a concurrent clear; never invent
 	// an empty history here.
 	if !s.messagesLoaded {
-		return
+		return fmt.Errorf("session history is not loaded")
 	}
 
 	s.Messages = append(s.Messages, msg)
@@ -293,11 +321,17 @@ func (s *Session) AddProviderMessage(msg provider.Message) {
 		}
 		s.Title = title
 	}
+	return nil
 }
 
 // AddMessage 添加消息
 func (s *Session) AddMessage(role, content string) {
 	s.AddProviderMessage(provider.Message{Role: role, Content: content})
+}
+
+// AddMessageWithError is the error-reporting form of AddMessage.
+func (s *Session) AddMessageWithError(role, content string) error {
+	return s.AddProviderMessageWithError(provider.Message{Role: role, Content: content})
 }
 
 // AddToolMessage 添加工具结果消息
@@ -337,6 +371,11 @@ func (s *Session) AddCompactBoundary(meta CompactMetadata) provider.Message {
 }
 
 func (s *Session) UndoLatestCompactBoundary(keepAfter bool) (CompactMetadata, error) {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return CompactMetadata{}, err
+	}
 	if err := s.loadMessages(); err != nil {
 		return CompactMetadata{}, err
 	}
@@ -496,23 +535,38 @@ func CompactTraceFromMetadata(meta CompactMetadata) CompactTrace {
 // GetMessages 获取消息（懒加载 + 滑动窗口）
 // maxTurns: 最大对话轮数（0=全部），一轮 = 一条 user + 一条 assistant
 func (s *Session) GetMessages(maxTurns ...int) []provider.Message {
+	messages, _ := s.GetMessagesWithError(maxTurns...)
+	return messages
+}
+
+// GetMessagesWithError preserves load and lifecycle errors for callers that
+// must distinguish unavailable history from an empty conversation.
+func (s *Session) GetMessagesWithError(maxTurns ...int) ([]provider.Message, error) {
+	if s == nil {
+		return nil, fmt.Errorf("session is nil")
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return nil, err
+	}
 	// 懒加载
 	if err := s.loadMessages(); err != nil {
-		return nil
+		return nil, err
 	}
 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	if len(s.Messages) == 0 {
-		return nil
+		return nil, nil
 	}
 
 	// 无窗口限制，返回全部
 	if len(maxTurns) == 0 || maxTurns[0] <= 0 {
 		cp := make([]provider.Message, len(s.Messages))
 		copy(cp, s.Messages)
-		return cp
+		return cp, nil
 	}
 
 	window := maxTurns[0]
@@ -530,7 +584,7 @@ func (s *Session) GetMessages(maxTurns ...int) []provider.Message {
 
 	cp := make([]provider.Message, len(s.Messages)-start)
 	copy(cp, s.Messages[start:])
-	return cp
+	return cp, nil
 }
 
 const maxPageCacheMessages = 500
@@ -545,10 +599,50 @@ func (s *Session) GetMessagesPage(limit, offset int) ([]provider.Message, int, b
 	if offset < 0 {
 		offset = 0
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return nil, 0, false, err
+	}
 
 	s.mu.RLock()
 	if s.messagesLoaded {
 		total := len(s.Messages)
+		page, ok := selectMessagePage(s.Messages, 0, total, limit, offset)
+		s.mu.RUnlock()
+		if !ok {
+			page = []provider.Message{}
+		}
+		return page, total, pageStart(total, limit, offset) > 0, nil
+	}
+	if s.format == FormatSegmentV1 {
+		index := s.pageIndex
+		expected := s.messageCount
+		s.mu.RUnlock()
+		s.loadMu.Lock()
+		defer s.loadMu.Unlock()
+		page, total, more, next, err := readMessagesJSONLPage(s.messagesJSONLPath(), limit, offset, index)
+		if err == nil {
+			if total < expected {
+				return nil, 0, false, fmt.Errorf("load session history: found %d messages, expected at least %d persisted messages", total, expected)
+			}
+			s.mu.Lock()
+			s.pageIndex = next
+			s.messageCount = total
+			s.persistedCount = total
+			s.mu.Unlock()
+			if next != index {
+				// Rebuilds also detect external replacements or an append whose
+				// metadata update was interrupted. Refresh size once per change.
+				s.refreshStorageBytesLocked()
+			}
+			return page, total, more, nil
+		}
+		if loadErr := s.loadMessagesLocked(); loadErr != nil {
+			return nil, 0, false, loadErr
+		}
+		s.mu.RLock()
+		total = len(s.Messages)
 		page, ok := selectMessagePage(s.Messages, 0, total, limit, offset)
 		s.mu.RUnlock()
 		if !ok {
@@ -678,10 +772,16 @@ func (s *Session) invalidatePageCacheLocked() {
 	s.pageCacheStart = 0
 	s.pageCacheTotal = 0
 	s.pageCacheValid = false
+	s.pageIndex = nil
 }
 
 // LastMessage 获取最后一条消息
 func (s *Session) LastMessage() *provider.Message {
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if s.checkLiveLocked() != nil {
+		return nil
+	}
 	// 懒加载
 	if err := s.loadMessages(); err != nil {
 		return nil
@@ -713,28 +813,47 @@ func (s *Session) messageCountLocked() int {
 // Save 保存会话到磁盘。新会话默认 segment_v1（jsonl append + blobs）；
 // 仍为 legacy_md 的旧会话在首次 Save 时迁移到 segment_v1。
 func (s *Session) Save() error {
+	if s == nil {
+		return fmt.Errorf("session is nil")
+	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	return s.saveLocked()
+}
+
+// saveLocked persists a consistent transcript while saveMu is held. Structural
+// operations such as Roll and RestoreBackup use this instead of reentering Save.
+func (s *Session) saveLocked() error {
+	if err := s.checkLiveLocked(); err != nil {
+		return err
+	}
 	// A metadata-only session must not be overwritten with an empty messages
 	// array when a caller updates its title or shell context.
 	if err := s.loadMessages(); err != nil {
 		return err
 	}
 
-	s.saveMu.Lock()
-	defer s.saveMu.Unlock()
 	if err := os.MkdirAll(s.dir, 0700); err != nil {
 		return fmt.Errorf("create session dir: %w", err)
 	}
 
-	s.mu.Lock()
-	if s.format == "" || s.format == FormatLegacyMD {
-		s.format = FormatSegmentV1
-		s.needsFullRewrite = true
-		s.persistedCount = 0
-	}
-	messages := append([]provider.Message(nil), s.Messages...)
+	s.mu.RLock()
 	format := s.format
 	persisted := s.persistedCount
 	needsRewrite := s.needsFullRewrite
+	if format == "" || format == FormatLegacyMD {
+		format = FormatSegmentV1
+		needsRewrite = true
+		persisted = 0
+	}
+	total := len(s.Messages)
+	start := persisted
+	if needsRewrite || start > total {
+		start = 0
+	}
+	// A normal append only copies and externalizes the unpersisted tail. The
+	// lifecycle lock keeps the prefix stable while disk I/O runs without mu.
+	messages := append([]provider.Message(nil), s.Messages[start:]...)
 	title := s.Title
 	agentRole := s.AgentRole
 	agentSystemPrompt := s.AgentSystemPrompt
@@ -752,7 +871,7 @@ func (s *Session) Save() error {
 		}
 	}
 	shell := ShellContext{Cwd: s.ShellContext.Cwd, Env: env}
-	s.mu.Unlock()
+	s.mu.RUnlock()
 
 	if err := s.externalizeMessages(messages); err != nil {
 		return fmt.Errorf("externalize session blobs: %w", err)
@@ -761,12 +880,12 @@ func (s *Session) Save() error {
 	var byteSize int64
 	switch format {
 	case FormatSegmentV1:
-		if needsRewrite || persisted > len(messages) {
+		if needsRewrite || persisted > total {
 			if err := s.rewriteMessagesJSONL(messages); err != nil {
 				return fmt.Errorf("rewrite segment messages: %w", err)
 			}
-		} else if persisted < len(messages) {
-			if err := s.appendMessagesJSONL(messages[persisted:]); err != nil {
+		} else if persisted < total {
+			if err := s.appendMessagesJSONL(messages); err != nil {
 				return fmt.Errorf("append segment messages: %w", err)
 			}
 		}
@@ -783,11 +902,14 @@ func (s *Session) Save() error {
 	}
 
 	s.mu.Lock()
-	s.Messages = messages
-	s.messageCount = len(messages)
-	s.persistedCount = len(messages)
+	copy(s.Messages[start:], messages)
+	s.messageCount = total
+	s.persistedCount = total
 	s.needsFullRewrite = false
 	s.format = format
+	s.storageBytes = byteSize
+	s.storageBytesValid = true
+	s.invalidatePageCacheLocked()
 	s.mu.Unlock()
 
 	meta := sessionMetadata{
@@ -797,7 +919,7 @@ func (s *Session) Save() error {
 		AgentSystemPrompt: agentSystemPrompt,
 		Pinned:            pinned,
 		Project:           project,
-		MessageCount:      len(messages),
+		MessageCount:      total,
 		CreatedAt:         createdAt,
 		UpdatedAt:         updatedAt,
 		ByteSize:          byteSize,
@@ -1011,12 +1133,18 @@ func (m *Manager) loadFromDisk() error {
 				continue // 跳过无法解析的文件
 			}
 			meta = sessionMetadata{
-				ID:           sd.ID,
-				Title:        sd.Title,
-				MessageCount: count,
-				CreatedAt:    sd.CreatedAt,
-				UpdatedAt:    sd.UpdatedAt,
-				Format:       FormatLegacyMD,
+				ID:                sd.ID,
+				Title:             sd.Title,
+				AgentRole:         sd.AgentRole,
+				AgentSystemPrompt: sd.AgentSystemPrompt,
+				Pinned:            sd.Pinned,
+				Project:           sd.Project,
+				ShellContext:      sd.ShellContext,
+				MessageCount:      count,
+				CreatedAt:         sd.CreatedAt,
+				UpdatedAt:         sd.UpdatedAt,
+				ByteSize:          fileByteSize(path),
+				Format:            FormatLegacyMD,
 			}
 		}
 		if meta.ID == "" {
@@ -1042,6 +1170,13 @@ func (m *Manager) newSessionStub(meta sessionMetadata, format string) *Session {
 	if format == "" {
 		format = FormatLegacyMD
 	}
+	if meta.ByteSize == 0 {
+		if format == FormatSegmentV1 {
+			meta.ByteSize = segmentStorageBytes(filepath.Join(m.dir, meta.ID))
+		} else {
+			meta.ByteSize = fileByteSize(filepath.Join(m.dir, meta.ID+".md"))
+		}
+	}
 	return &Session{
 		ID:                meta.ID,
 		Title:             meta.Title,
@@ -1058,6 +1193,8 @@ func (m *Manager) newSessionStub(meta sessionMetadata, format string) *Session {
 		messagesLoaded:    false,
 		messageCount:      meta.MessageCount,
 		persistedCount:    meta.MessageCount,
+		storageBytes:      meta.ByteSize,
+		storageBytesValid: true,
 	}
 }
 
@@ -1088,13 +1225,11 @@ func (s *Session) loadMessagesLocked() error {
 		return nil
 	}
 	format := s.format
+	expected := s.messageCount
 	s.mu.RUnlock()
 
 	var messages []provider.Message
-	var title string
-	var agentRole, agentSystemPrompt string
-	var createdAt, updatedAt time.Time
-	var shell ShellContext
+	fromLegacy := false
 
 	switch format {
 	case FormatSegmentV1:
@@ -1107,82 +1242,70 @@ func (s *Session) loadMessagesLocked() error {
 			legacy, legacyErr := s.loadLegacyMessages()
 			if legacyErr != nil {
 				if os.IsNotExist(legacyErr) {
+					if expected > 0 {
+						return fmt.Errorf("load segment messages: %w", err)
+					}
 					messages = []provider.Message{}
 				} else {
 					return fmt.Errorf("load legacy messages: %w", legacyErr)
 				}
 			} else {
 				messages = legacy
+				fromLegacy = true
 			}
 		} else if len(loaded) == 0 {
 			// Mid-migrate or empty segment: prefer legacy body if present.
 			legacy, legacyErr := s.loadLegacyMessages()
 			if legacyErr != nil {
 				if os.IsNotExist(legacyErr) {
+					if expected > 0 {
+						return fmt.Errorf("load segment messages: empty transcript for %d persisted messages", expected)
+					}
 					messages = loaded
 				} else {
 					return fmt.Errorf("load legacy messages: %w", legacyErr)
 				}
 			} else if len(legacy) > 0 {
 				messages = legacy
+				fromLegacy = true
 			} else {
 				messages = loaded
 			}
 		} else {
 			messages = loaded
 		}
-		if meta, ok := readSessionMetadataLoose(s.dir, s.ID); ok {
-			title = meta.Title
-			agentRole = meta.AgentRole
-			agentSystemPrompt = meta.AgentSystemPrompt
-			createdAt = meta.CreatedAt
-			updatedAt = meta.UpdatedAt
-			shell = meta.ShellContext
-		}
 	default:
-		loaded, sd, err := s.loadLegacyMessagesWithMeta()
+		loaded, _, err := s.loadLegacyMessagesWithMeta()
 		if err != nil {
 			if os.IsNotExist(err) {
+				if expected > 0 {
+					return fmt.Errorf("load legacy messages: %w", err)
+				}
 				messages = []provider.Message{}
 			} else {
 				return fmt.Errorf("load legacy messages: %w", err)
 			}
 		} else {
 			messages = loaded
-			title = sd.Title
-			agentRole = sd.AgentRole
-			agentSystemPrompt = sd.AgentSystemPrompt
-			createdAt = sd.CreatedAt
-			updatedAt = sd.UpdatedAt
-			shell = sd.ShellContext
 		}
 	}
 
+	if len(messages) < expected {
+		return fmt.Errorf("load session history: found %d messages, expected at least %d persisted messages", len(messages), expected)
+	}
 	s.mu.Lock()
-	if title != "" {
-		s.Title = title
-	}
-	if agentRole != "" {
-		s.AgentRole = agentRole
-	}
-	if agentSystemPrompt != "" {
-		s.AgentSystemPrompt = agentSystemPrompt
-	}
-	if !createdAt.IsZero() {
-		s.CreatedAt = createdAt
-	}
-	if !updatedAt.IsZero() {
-		s.UpdatedAt = updatedAt
-	}
-	if shell.Cwd != "" || shell.Env != nil {
-		s.ShellContext = shell
-	}
+	// Metadata is initialized when the Manager creates the stub. Reading the
+	// transcript must not roll back setters applied before the first lazy load.
 	s.Messages = messages
 	if s.Messages == nil {
 		s.Messages = make([]provider.Message, 0)
 	}
 	s.messageCount = len(s.Messages)
 	s.persistedCount = len(s.Messages)
+	if fromLegacy {
+		s.persistedCount = 0
+		s.needsFullRewrite = true
+	}
 	s.messagesLoaded = true
 	s.invalidatePageCacheLocked()
 	s.mu.Unlock()
@@ -1298,6 +1421,14 @@ func readSessionFile(path string, onMessage func(provider.Message) error) (sessi
 			}
 		case "title":
 			if err := decoder.Decode(&data.Title); err != nil {
+				return sessionData{}, 0, err
+			}
+		case "pinned":
+			if err := decoder.Decode(&data.Pinned); err != nil {
+				return sessionData{}, 0, err
+			}
+		case "project":
+			if err := decoder.Decode(&data.Project); err != nil {
 				return sessionData{}, 0, err
 			}
 		case "agent_role":
@@ -1507,15 +1638,8 @@ func (m *Manager) ListInfo() []SessionInfo {
 			format = FormatLegacyMD
 		}
 		id, title, agentRole, pinned, project, count := s.ID, s.Title, s.AgentRole, s.Pinned, s.Project, s.messageCountLocked()
-		created, updated, dir := s.CreatedAt, s.UpdatedAt, s.dir
+		created, updated, byteSize := s.CreatedAt, s.UpdatedAt, s.storageBytes
 		s.mu.RUnlock()
-		byteSize := int64(0)
-		switch format {
-		case FormatSegmentV1:
-			byteSize = segmentStorageBytes(filepath.Join(dir, id))
-		default:
-			byteSize = fileByteSize(filepath.Join(dir, id+".md"))
-		}
 		infos = append(infos, SessionInfo{
 			ID:           id,
 			Title:        title,
@@ -1596,7 +1720,7 @@ func (m *Manager) Search(query string) []SessionInfo {
 			UpdatedAt:    s.UpdatedAt,
 		}
 		loaded := s.messagesLoaded
-		messages := s.Messages
+		messages := append([]provider.Message(nil), s.Messages...)
 		matched := strings.Contains(strings.ToLower(s.Title), lowerQuery) ||
 			strings.Contains(strings.ToLower(s.Project), lowerQuery) ||
 			strings.Contains(strings.ToLower(s.ID), lowerQuery)
@@ -1630,10 +1754,12 @@ func (m *Manager) Search(query string) []SessionInfo {
 
 // SaveMetadata writes title, pin, and project without rewriting the transcript.
 func (s *Session) SaveMetadata() error {
-	if err := s.loadMessages(); err != nil {
-		return err
+	if s == nil {
+		return fmt.Errorf("session is nil")
 	}
-	return s.Save()
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	return s.saveMetadataLocked()
 }
 
 // Delete 删除会话
@@ -1645,12 +1771,28 @@ func (m *Manager) Delete(id string) error {
 	if !ok {
 		return fmt.Errorf("session not found: %s", id)
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return err
+	}
 
 	// 删除磁盘文件
+	if err := os.RemoveAll(filepath.Join(s.dir, s.ID)); err != nil {
+		return fmt.Errorf("delete session data: %w", err)
+	}
 	path := filepath.Join(s.dir, s.ID+".md")
-	os.Remove(path)                             // 忽略错误，文件可能不存在
-	os.Remove(sessionMetadataPath(s.dir, s.ID)) // 旁路元数据同样可选
-	os.RemoveAll(filepath.Join(s.dir, s.ID))    // segment_v1 data dir
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete legacy session: %w", err)
+	}
+	if err := os.Remove(sessionMetadataPath(s.dir, s.ID)); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("delete session metadata: %w", err)
+	}
+	s.mu.Lock()
+	s.deleted = true
+	s.storageBytes = 0
+	s.invalidatePageCacheLocked()
+	s.mu.Unlock()
 
 	delete(m.sessions, id)
 	return nil
@@ -1658,11 +1800,8 @@ func (m *Manager) Delete(id string) error {
 
 // SaveAll 保存所有会话到磁盘
 func (m *Manager) SaveAll() error {
-	m.mu.RLock()
-	defer m.mu.RUnlock()
-
 	var errs []error
-	for _, s := range m.sessions {
+	for _, s := range m.List() {
 		if err := s.Save(); err != nil {
 			errs = append(errs, fmt.Errorf("save session %s: %w", s.ID, err))
 		}
@@ -1695,6 +1834,17 @@ func (m *Manager) Upsert(s *Session) {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if s.checkLiveLocked() != nil {
+		return
+	}
+	s.mu.RLock()
+	knownSize := s.storageBytesValid
+	s.mu.RUnlock()
+	if !knownSize {
+		s.refreshStorageBytesLocked()
+	}
 	m.sessions[s.ID] = s
 }
 

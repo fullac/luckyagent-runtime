@@ -112,14 +112,41 @@ func (s *Session) ExternalizeLargeMessages() error {
 	if s == nil {
 		return nil
 	}
+	s.saveMu.Lock()
+	defer s.saveMu.Unlock()
+	if err := s.checkLiveLocked(); err != nil {
+		return err
+	}
+	return s.externalizeLargeMessagesLocked()
+}
+
+// externalizeLargeMessagesLocked requires saveMu. It works on a copy so readers
+// never observe partially externalized messages or mutations of their slices.
+func (s *Session) externalizeLargeMessagesLocked() error {
 	if err := s.loadMessages(); err != nil {
 		return err
 	}
-	s.mu.Lock()
-	messages := s.Messages
-	s.mu.Unlock()
-	if err := s.externalizeMessages(messages); err != nil {
-		return err
+	s.mu.RLock()
+	messages := append([]provider.Message(nil), s.Messages...)
+	s.mu.RUnlock()
+	changed, storageMayChange := false, false
+	defer func() {
+		if storageMayChange {
+			s.refreshStorageBytesLocked()
+		}
+	}()
+	for i := range messages {
+		before := messages[i]
+		if before.BlobHash == "" && len(before.Content) >= blobThreshold() && !IsCompactBoundary(before) {
+			storageMayChange = true
+		}
+		if err := s.externalizeLargeContent(&messages[i]); err != nil {
+			return err
+		}
+		changed = changed || before.Content != messages[i].Content || before.BlobHash != messages[i].BlobHash
+	}
+	if !changed {
+		return nil
 	}
 	s.mu.Lock()
 	s.Messages = messages
