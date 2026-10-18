@@ -40,6 +40,12 @@ catalog before explicit activation, including trusted plugin servers. It starts
 no connections and leaves active sessions unchanged; see
 [MCP configuration lifecycle](docs/mcp-lifecycle.md).
 
+## Provider options
+
+[Prompt caching request options](docs/prompt-caching.md) describes stable tool
+schemas and the optional `models.endpoints.chat.prompt_cache_key`, including
+the independent per-fallback setting and both OpenAI protocols.
+
 ## Validation
 
 ```bash

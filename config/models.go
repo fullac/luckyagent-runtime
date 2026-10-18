@@ -96,6 +96,7 @@ type ModelEndpointConfig struct {
 	Protocol         string            `json:"protocol,omitempty"`
 	ReasoningSummary string            `json:"reasoning_summary,omitempty"`
 	ReasoningEffort  string            `json:"reasoning_effort,omitempty"`
+	PromptCacheKey   string            `json:"prompt_cache_key,omitempty"`
 	ExtraHeaders     map[string]string `json:"extra_headers,omitempty"`
 	TimeoutSeconds   int               `json:"timeout_seconds,omitempty"`
 }
@@ -118,6 +119,7 @@ type ModelSelection struct {
 	Protocol         string
 	ReasoningSummary string
 	ReasoningEffort  string
+	PromptCacheKey   string
 	ExtraHeaders     map[string]string
 	TimeoutSeconds   int
 }
@@ -209,6 +211,9 @@ func mergeModelEndpoint(base, override ModelEndpointConfig) ModelEndpointConfig 
 	if value := strings.TrimSpace(override.ReasoningEffort); value != "" {
 		result.ReasoningEffort = value
 	}
+	if value := strings.TrimSpace(override.PromptCacheKey); value != "" {
+		result.PromptCacheKey = value
+	}
 	if override.ExtraHeaders != nil {
 		result.ExtraHeaders = cloneStringMap(override.ExtraHeaders)
 	}
@@ -226,6 +231,7 @@ func legacyModelSelection(cfg *Config, kind ModelKind) ModelSelection {
 	selection.Protocol = endpoint.Protocol
 	selection.ReasoningSummary = endpoint.ReasoningSummary
 	selection.ReasoningEffort = endpoint.ReasoningEffort
+	selection.PromptCacheKey = endpoint.PromptCacheKey
 	selection.ExtraHeaders = cloneStringMap(endpoint.ExtraHeaders)
 	selection.TimeoutSeconds = endpoint.TimeoutSeconds
 	switch kind {
@@ -257,6 +263,7 @@ func legacyEndpoint(cfg *Config, kind ModelKind) ModelEndpointConfig {
 			Protocol:         cfg.LlmProvider.Protocol,
 			ReasoningSummary: cfg.LlmProvider.ReasoningSummary,
 			ReasoningEffort:  cfg.LlmProvider.ReasoningEffort,
+			PromptCacheKey:   cfg.LlmProvider.PromptCacheKey,
 			ExtraHeaders:     cloneStringMap(cfg.ExtraHeaders),
 		}
 	case ModelKindEmbedding:
@@ -292,6 +299,7 @@ func syncLegacyModels(cfg *Config) {
 			cfg.LlmProvider.Protocol = endpoint.Protocol
 			cfg.LlmProvider.ReasoningSummary = endpoint.ReasoningSummary
 			cfg.LlmProvider.ReasoningEffort = endpoint.ReasoningEffort
+			cfg.LlmProvider.PromptCacheKey = endpoint.PromptCacheKey
 			cfg.Provider = cfg.LlmProvider.Name
 			cfg.APIKey = cfg.LlmProvider.APIKey
 			cfg.APIBase = cfg.LlmProvider.BaseURL
@@ -345,6 +353,7 @@ func (c *Config) ModelSelection(kind ModelKind) (ModelSelection, bool) {
 		selection.Protocol = endpoint.Protocol
 		selection.ReasoningSummary = endpoint.ReasoningSummary
 		selection.ReasoningEffort = endpoint.ReasoningEffort
+		selection.PromptCacheKey = endpoint.PromptCacheKey
 		selection.ExtraHeaders = cloneStringMap(endpoint.ExtraHeaders)
 		selection.TimeoutSeconds = endpoint.TimeoutSeconds
 	}
