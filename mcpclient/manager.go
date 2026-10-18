@@ -51,6 +51,14 @@ func (m *Manager) Configure(config Config) error {
 	return nil
 }
 
+// Configured returns an owned copy of the declarative startup/reconnect catalog.
+// Applications can merge additions without discarding injected server settings.
+func (m *Manager) Configured() Config {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.configured.Clone()
+}
+
 // SetPublisher installs the host's catalog adapter. Publication runs under the
 // manager lock so a newly visible handler can only execute against that same
 // connection generation. The callback must not call back into the Manager.

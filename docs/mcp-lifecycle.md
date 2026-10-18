@@ -6,6 +6,8 @@ catalog. Failure preserves the previous catalog; a closed manager rejects it.
 Configuration performs no network operations and leaves active connections
 unchanged. `Start` connects one snapshot of configured servers, while
 `ConnectConfigured` uses the current catalog for manual reconnect.
+`Configured()` returns a detached copy so callers can merge additions while
+preserving prepared server settings and the injected credential resolver.
 
 This allows the public Agent to merge trusted namespaced plugin MCP declarations
 into an injected manager before `Components.Start`, keeping backend construction
