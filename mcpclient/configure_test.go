@@ -23,6 +23,8 @@ func TestConfigureIsInertAtomicAndOwnsConfiguration(t *testing.T) {
 		t.Fatal(err)
 	}
 	config.Servers["plugin.docs"] = ServerConfig{URL: "http://127.0.0.1:1"}
+	snapshot := manager.Configured()
+	snapshot.Servers["plugin.docs"] = ServerConfig{URL: "http://127.0.0.1:1"}
 	if requests.Load() != 0 || len(manager.Status()) != 0 {
 		t.Fatal("configuration started a connection")
 	}
