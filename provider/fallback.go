@@ -1,0 +1,526 @@
+package provider
+
+import (
+	"context"
+	"fmt"
+	"log"
+	"strings"
+	"sync"
+	"time"
+)
+
+// FallbackConfig 定义降级链中一个节点的配置
+type FallbackConfig struct {
+	Name             string // provider name (openai, anthropic, ollama, openrouter, openai-compatible)
+	APIKey           string
+	APIBase          string
+	Model            string
+	Protocol         string
+	ReasoningSummary string
+	ReasoningEffort  string
+}
+
+// FallbackChain 实现 Provider 自动降级链
+// primary → fallback → local (Ollama)
+// 当 primary 失败时自动切换到下一个 provider
+type FallbackChain struct {
+	chain      []Provider
+	mu         sync.RWMutex
+	active     int // 当前活跃的 provider 索引
+	failCounts []int
+	disabled   []bool        // 配置类永久错误后禁用，直到显式重置或重建链
+	maxFails   int           // 连续失败多少次后降级
+	cooldown   time.Duration // 降级冷却时间
+	cooldownAt []time.Time   // 每个 provider 的冷却截止时间
+	onSwitch   func(from, to string)
+}
+
+// NewFallbackChain 创建降级链
+func NewFallbackChain(configs []FallbackConfig, registry *Registry) (*FallbackChain, error) {
+	if len(configs) == 0 {
+		return nil, fmt.Errorf("fallback chain requires at least one provider config")
+	}
+
+	chain := make([]Provider, 0, len(configs))
+	failCounts := make([]int, len(configs))
+	disabled := make([]bool, len(configs))
+	cooldownAt := make([]time.Time, len(configs))
+
+	for _, fc := range configs {
+		name := strings.TrimSpace(fc.Name)
+		if name == "" {
+			name = "openai"
+		}
+		pCfg := Config{
+			LlmProvider: LlmProvider{
+				Name:             name,
+				BaseURL:          fc.APIBase,
+				Model:            fc.Model,
+				APIKey:           fc.APIKey,
+				Protocol:         fc.Protocol,
+				ReasoningSummary: fc.ReasoningSummary,
+				ReasoningEffort:  fc.ReasoningEffort,
+			},
+		}
+		p, err := registry.Create(name, pCfg)
+		if err != nil {
+			return nil, fmt.Errorf("resolve provider %s: %w", name, err)
+		}
+		chain = append(chain, p)
+	}
+
+	return &FallbackChain{
+		chain:      chain,
+		failCounts: failCounts,
+		disabled:   disabled,
+		cooldownAt: cooldownAt,
+		maxFails:   3,
+		cooldown:   5 * time.Minute,
+	}, nil
+}
+
+// Name 返回当前活跃 provider 的名称
+func (fc *FallbackChain) Name() string {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return fc.chain[fc.active].Name()
+}
+
+// ActiveProvider 返回当前活跃的 Provider
+func (fc *FallbackChain) ActiveProvider() Provider {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return fc.chain[fc.active]
+}
+
+// Model returns the model of the currently active provider.
+func (fc *FallbackChain) Model() string {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	if modeler, ok := fc.chain[fc.active].(interface{ Model() string }); ok {
+		return modeler.Model()
+	}
+	return ""
+}
+
+// ActiveIndex 返回当前活跃 provider 的索引
+func (fc *FallbackChain) ActiveIndex() int {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return fc.active
+}
+
+// ChainLen 返回降级链长度
+func (fc *FallbackChain) ChainLen() int {
+	return len(fc.chain)
+}
+
+// ChainNames 返回降级链中所有 provider 名称
+func (fc *FallbackChain) ChainNames() []string {
+	names := make([]string, len(fc.chain))
+	for i, p := range fc.chain {
+		names[i] = p.Name()
+	}
+	return names
+}
+
+// SetOnSwitch 设置降级切换回调
+func (fc *FallbackChain) SetOnSwitch(fn func(from, to string)) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	fc.onSwitch = fn
+}
+
+// Chat 发送消息，自动降级
+func (fc *FallbackChain) Chat(ctx context.Context, messages []Message) (*Response, error) {
+	startIdx := fc.nextAvailable()
+	if startIdx < 0 {
+		return nil, fmt.Errorf("all providers in fallback chain are unavailable")
+	}
+
+	var lastErr error
+	for i := startIdx; i < len(fc.chain); i++ {
+		if !fc.isAvailable(i) {
+			continue
+		}
+
+		resp, err := fc.chain[i].Chat(ctx, messages)
+		if err != nil {
+			lastErr = err
+			if !fc.shouldTryNextProvider(i, err) {
+				return nil, err
+			}
+			log.Printf("[fallback] provider %s failed: %v, trying next", fc.chain[i].Name(), err)
+			continue
+		}
+
+		// 成功：重置失败计数，如果不在 active 位置则切换
+		fc.recordSuccess(i)
+		return resp, nil
+	}
+
+	return nil, fallbackChainError(len(fc.chain), lastErr)
+}
+
+// ChatStream 流式发送消息，自动降级
+func (fc *FallbackChain) ChatStream(ctx context.Context, messages []Message) (<-chan StreamChunk, error) {
+	startIdx := fc.nextAvailable()
+	if startIdx < 0 {
+		return nil, fmt.Errorf("all providers in fallback chain are unavailable")
+	}
+
+	var lastErr error
+	for i := startIdx; i < len(fc.chain); i++ {
+		if !fc.isAvailable(i) {
+			continue
+		}
+
+		ch, err := fc.chain[i].ChatStream(ctx, messages)
+		if err != nil {
+			lastErr = err
+			if !fc.shouldTryNextProvider(i, err) {
+				return nil, err
+			}
+			log.Printf("[fallback] provider %s stream failed: %v, trying next", fc.chain[i].Name(), err)
+			continue
+		}
+
+		fc.recordSuccess(i)
+		return ch, nil
+	}
+
+	return nil, fallbackChainError(len(fc.chain), lastErr)
+}
+
+func fallbackChainError(chainLen int, lastErr error) error {
+	if lastErr != nil {
+		return fmt.Errorf("all %d providers failed in fallback chain: %w", chainLen, lastErr)
+	}
+	return fmt.Errorf("all %d providers failed in fallback chain", chainLen)
+}
+
+// shouldDisableProviderOnError identifies configuration failures that will not
+// recover by retrying the same provider instance.
+func shouldDisableProviderOnError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "model_not_found") || strings.Contains(msg, "model not found") {
+		return true
+	}
+	for _, marker := range []string{
+		"api error 404",
+		"unexpected status 404",
+	} {
+		if strings.Contains(msg, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func (fc *FallbackChain) shouldTryNextProvider(idx int, err error) bool {
+	if shouldDisableProviderOnError(err) {
+		fc.disableProvider(idx, err)
+		return true
+	}
+	if !shouldFallbackOnError(err) {
+		return false
+	}
+	fc.recordFailure(idx, err)
+	return true
+}
+
+func shouldFallbackOnError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	msg := strings.ToLower(err.Error())
+	if msg == "context deadline exceeded" || msg == "context canceled" {
+		return true
+	}
+	if strings.Contains(msg, "429") || strings.Contains(msg, "rate limit") || strings.Contains(msg, "too many requests") {
+		return true
+	}
+	if strings.Contains(msg, "500") || strings.Contains(msg, "502") || strings.Contains(msg, "503") || strings.Contains(msg, "504") {
+		return true
+	}
+	if strings.Contains(msg, "connection refused") || strings.Contains(msg, "connection reset") || strings.Contains(msg, "timeout") {
+		return true
+	}
+	if strings.Contains(msg, "temporary") || strings.Contains(msg, "temporarily unavailable") {
+		return true
+	}
+	if strings.Contains(msg, "eof") || strings.Contains(msg, "tls") {
+		return true
+	}
+	return false
+}
+
+// Validate 验证降级链中至少有一个可用 provider
+func (fc *FallbackChain) Validate() error {
+	hasValid := false
+	for i, p := range fc.chain {
+		if err := p.Validate(); err != nil {
+			log.Printf("[fallback] provider %s invalid: %v", p.Name(), err)
+			continue
+		}
+		hasValid = true
+		_ = i
+	}
+	if !hasValid {
+		return fmt.Errorf("no valid provider in fallback chain")
+	}
+	return nil
+}
+
+// nextAvailable 找到下一个可用的 provider 索引
+func (fc *FallbackChain) nextAvailable() int {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+
+	// 每个新请求都从最高优先级开始。处于冷却或因配置错误被禁用的
+	// 节点会被跳过；冷却结束后主节点会自然获得一次恢复探测。
+	for i := 0; i < len(fc.chain); i++ {
+		if fc.isAvailableLocked(i) {
+			return i
+		}
+	}
+	return -1
+}
+
+// isAvailable 检查指定索引的 provider 是否可用
+func (fc *FallbackChain) isAvailable(idx int) bool {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+	return fc.isAvailableLocked(idx)
+}
+
+// isAvailableLocked 不加锁的可用性检查
+func (fc *FallbackChain) isAvailableLocked(idx int) bool {
+	if idx < 0 || idx >= len(fc.chain) {
+		return false
+	}
+	if fc.disabled[idx] {
+		return false
+	}
+	// 冷却期内不可用
+	if !fc.cooldownAt[idx].IsZero() && time.Now().Before(fc.cooldownAt[idx]) {
+		return false
+	}
+	return true
+}
+
+// disableProvider marks a provider unavailable for the lifetime of this
+// chain. Configuration reloads rebuild the chain; reset methods also allow an
+// explicit in-process recovery.
+func (fc *FallbackChain) disableProvider(idx int, err error) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if idx < 0 || idx >= len(fc.chain) {
+		return
+	}
+
+	fc.disabled[idx] = true
+	log.Printf("[fallback] provider %s disabled after permanent error: %v", fc.chain[idx].Name(), err)
+	if idx != fc.active {
+		return
+	}
+
+	for i := 0; i < len(fc.chain); i++ {
+		if !fc.isAvailableLocked(i) {
+			continue
+		}
+		oldName := fc.chain[idx].Name()
+		fc.active = i
+		newName := fc.chain[i].Name()
+		log.Printf("[fallback] switching from %s to %s", oldName, newName)
+		if fc.onSwitch != nil {
+			go fc.onSwitch(oldName, newName)
+		}
+		return
+	}
+}
+
+// recordFailure 记录失败
+func (fc *FallbackChain) recordFailure(idx int, err error) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	fc.failCounts[idx]++
+	log.Printf("[fallback] provider %s fail count: %d/%d", fc.chain[idx].Name(), fc.failCounts[idx], fc.maxFails)
+
+	if fc.failCounts[idx] >= fc.maxFails {
+		// 设置冷却
+		fc.cooldownAt[idx] = time.Now().Add(fc.cooldown)
+		log.Printf("[fallback] provider %s entering cooldown for %v", fc.chain[idx].Name(), fc.cooldown)
+
+		// 如果是当前 active，切换到下一个
+		if idx == fc.active {
+			oldName := fc.chain[idx].Name()
+			for i := idx + 1; i < len(fc.chain); i++ {
+				if fc.isAvailableLocked(i) {
+					fc.active = i
+					newName := fc.chain[i].Name()
+					log.Printf("[fallback] switching from %s to %s", oldName, newName)
+					cb := fc.onSwitch // read under lock
+					if cb != nil {
+						go cb(oldName, newName)
+					}
+					break
+				}
+			}
+		}
+	}
+}
+
+// recordSuccess 记录成功
+func (fc *FallbackChain) recordSuccess(idx int) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+
+	fc.failCounts[idx] = 0
+	fc.cooldownAt[idx] = time.Time{} // 清除冷却
+
+	// 如果成功的不在 active 位置，切换回来（优先使用更靠前的 provider）
+	if idx < fc.active {
+		oldName := fc.chain[fc.active].Name()
+		fc.active = idx
+		newName := fc.chain[idx].Name()
+		log.Printf("[fallback] switching back from %s to %s (higher priority)", oldName, newName)
+		cb := fc.onSwitch
+		if cb != nil {
+			go cb(oldName, newName)
+		}
+	} else if idx != fc.active {
+		oldName := fc.chain[fc.active].Name()
+		fc.active = idx
+		newName := fc.chain[idx].Name()
+		log.Printf("[fallback] switching from %s to %s", oldName, newName)
+		cb := fc.onSwitch
+		if cb != nil {
+			go cb(oldName, newName)
+		}
+	}
+}
+
+// ResetCooldown 重置指定 provider 的冷却状态
+func (fc *FallbackChain) ResetCooldown(idx int) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if idx >= 0 && idx < len(fc.chain) {
+		fc.failCounts[idx] = 0
+		fc.disabled[idx] = false
+		fc.cooldownAt[idx] = time.Time{}
+	}
+}
+
+// ResetAllCooldowns 重置所有 provider 的冷却状态
+func (fc *FallbackChain) ResetAllCooldowns() {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	for i := range fc.chain {
+		fc.failCounts[i] = 0
+		fc.disabled[i] = false
+		fc.cooldownAt[i] = time.Time{}
+	}
+	fc.active = 0
+}
+
+// Ensure FallbackChain implements Provider and FunctionCallingProvider
+var (
+	_ Provider                = (*FallbackChain)(nil)
+	_ FunctionCallingProvider = (*FallbackChain)(nil)
+)
+
+// ChatWithOptions 发送消息（支持 function calling），自动降级
+func (fc *FallbackChain) ChatWithOptions(ctx context.Context, messages []Message, opts CallOptions) (*Response, error) {
+	startIdx := fc.nextAvailable()
+	if startIdx < 0 {
+		return nil, fmt.Errorf("all providers in fallback chain are unavailable")
+	}
+
+	var lastErr error
+	for i := startIdx; i < len(fc.chain); i++ {
+		if !fc.isAvailable(i) {
+			continue
+		}
+
+		p := fc.chain[i]
+		if fcProvider, ok := p.(FunctionCallingProvider); ok && len(opts.Tools) > 0 {
+			resp, err := fcProvider.ChatWithOptions(ctx, messages, opts)
+			if err != nil {
+				lastErr = err
+				if !fc.shouldTryNextProvider(i, err) {
+					return nil, err
+				}
+				log.Printf("[fallback] provider %s ChatWithOptions failed: %v, trying next", p.Name(), err)
+				continue
+			}
+			fc.recordSuccess(i)
+			return resp, nil
+		}
+
+		// Provider 不支持 function calling，回退到普通 Chat
+		resp, err := p.Chat(ctx, messages)
+		if err != nil {
+			lastErr = err
+			if !fc.shouldTryNextProvider(i, err) {
+				return nil, err
+			}
+			log.Printf("[fallback] provider %s Chat failed: %v, trying next", p.Name(), err)
+			continue
+		}
+		fc.recordSuccess(i)
+		return resp, nil
+	}
+
+	return nil, fallbackChainError(len(fc.chain), lastErr)
+}
+
+// ChatStreamWithOptions 流式发送消息（支持 function calling），自动降级
+func (fc *FallbackChain) ChatStreamWithOptions(ctx context.Context, messages []Message, opts CallOptions) (<-chan StreamChunk, error) {
+	startIdx := fc.nextAvailable()
+	if startIdx < 0 {
+		return nil, fmt.Errorf("all providers in fallback chain are unavailable")
+	}
+
+	var lastErr error
+	for i := startIdx; i < len(fc.chain); i++ {
+		if !fc.isAvailable(i) {
+			continue
+		}
+
+		p := fc.chain[i]
+		if fcProvider, ok := p.(FunctionCallingProvider); ok && len(opts.Tools) > 0 {
+			ch, err := fcProvider.ChatStreamWithOptions(ctx, messages, opts)
+			if err != nil {
+				lastErr = err
+				if !fc.shouldTryNextProvider(i, err) {
+					return nil, err
+				}
+				log.Printf("[fallback] provider %s ChatStreamWithOptions failed: %v, trying next", p.Name(), err)
+				continue
+			}
+			fc.recordSuccess(i)
+			return ch, nil
+		}
+
+		// Provider 不支持 function calling，回退到普通 ChatStream
+		ch, err := p.ChatStream(ctx, messages)
+		if err != nil {
+			lastErr = err
+			if !fc.shouldTryNextProvider(i, err) {
+				return nil, err
+			}
+			log.Printf("[fallback] provider %s ChatStream failed: %v, trying next", p.Name(), err)
+			continue
+		}
+		fc.recordSuccess(i)
+		return ch, nil
+	}
+
+	return nil, fallbackChainError(len(fc.chain), lastErr)
+}

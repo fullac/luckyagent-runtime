@@ -1,0 +1,46 @@
+# LuckyAgent runtime components
+
+`github.com/yurika0211/luckyagent-runtime` provides the public components used
+by the Agent core and the full LuckyAgent application. It does not import the
+Agent or application modules.
+
+| Packages | Ownership |
+| --- | --- |
+| `provider`, `middleware`, `resilience` | Model protocols, discovery, catalogs, streaming, fallback and call governance |
+| `session` | JSONL history, blobs, pagination, backups, migration and compact boundaries |
+| `rag`, `embedder` | Retrieval, embeddings, graph/vector/SQLite and stream indexing |
+| `memoryaestus` | Aestus adapter, session buffers/summaries, maintenance and optional Tidal resources |
+| `config` | Existing shared configuration schema, defaults, migration, persistence and reload classification |
+| `bootstrap` | Default component preparation, explicit application activation and owned resource cleanup |
+| `appservice`, `appservice/profile` | Neutral session/model/config operations and startup Profile persistence |
+| `mcpclient`, `credentials`, `proactive` | MCP connections, credential backend and proactive prediction/feedback |
+| `contextx`, `hook`, `soul`, `logger`, `metrics`, `telemetry` | Supporting runtime capabilities |
+| `tool`, `turn`, `gateway`, `health`, `workflow` | Compatibility bindings to existing tool and transport modules |
+
+The existing configuration fields, conversation JSON fields and runtime-home
+layout are preserved. The Aestus SDK is imported only from `memoryaestus`;
+consumers use its public memory ports. The execution kernels and generic tools
+remain in `luckyagent-tools`; API/platform protocols remain in the independent
+API and gateway modules.
+
+## Resource lifecycle
+
+`bootstrap.Open(configManager, optionalMemoryRuntime)` prepares dependencies.
+It does not start MCP connections, proactive workers or Agent execution.
+`Components.Start(ctx, Hooks)` activates the application once using injected
+callbacks. `Close` is idempotent and also handles partial preparation. A closed
+component set cannot be restarted. Applications serialize lifecycle calls.
+
+The public Agent's `NewWithDependencies` consumes these prepared resources.
+Default application startup lives in `luckyagent-app/bootstrap`. Resources stay
+with their creator unless ownership is explicitly transferred.
+
+## Validation
+
+```bash
+GOWORK=off go test -mod=readonly -race -p 2 ./...
+GOWORK=off go vet ./...
+```
+
+The module import-boundary test rejects dependencies on the Agent, the
+application and the former host's internal packages, including in tests.
