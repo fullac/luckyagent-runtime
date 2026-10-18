@@ -16,6 +16,7 @@ func canonicalModelKey(key string) string {
 		"llm_provider.model": "models.active.chat", "llm_provider.protocol": "models.endpoints.chat.protocol",
 		"llm_provider.reasoning_summary": "models.endpoints.chat.reasoning_summary",
 		"llm_provider.reasoning_effort":  "models.endpoints.chat.reasoning_effort",
+		"llm_provider.prompt_cache_key":  "models.endpoints.chat.prompt_cache_key",
 		"multimodal.image_model":         "models.active.vision", "multimodal.transcription_model": "models.active.transcription",
 	}
 	if alias, ok := aliases[key]; ok {
@@ -101,6 +102,8 @@ func (c *Config) setModelKey(key, value string) (bool, error) {
 			} else {
 				ep.ReasoningEffort = normalized
 			}
+		case "prompt_cache_key":
+			ep.PromptCacheKey = strings.TrimSpace(value)
 		case "timeout_seconds":
 			n, err := strconv.Atoi(value)
 			if err != nil || n < 0 {

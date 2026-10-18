@@ -234,6 +234,7 @@ type LlmProvider struct {
 	Protocol         string  `json:"protocol,omitempty"`
 	ReasoningSummary string  `json:"reasoning_summary,omitempty"`
 	ReasoningEffort  string  `json:"reasoning_effort,omitempty"`
+	PromptCacheKey   string  `json:"prompt_cache_key,omitempty"`
 	Dimension        int     `json:"dimension"`
 	Temperature      float64 `json:"temperature"`
 }
