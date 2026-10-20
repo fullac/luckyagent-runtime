@@ -47,6 +47,12 @@ type Message struct {
 	Name       string     `json:"name,omitempty"`         // function name for tool messages
 	ToolCalls  []ToolCall `json:"tool_calls,omitempty"`   // assistant tool calls
 
+	// Observation stays in the session record. Provider adapters omit it.
+	RunID      string     `json:"run_id,omitempty"`
+	StartedAt  *time.Time `json:"started_at,omitempty"`
+	DurationMS int64      `json:"duration_ms,omitempty"`
+	Status     string     `json:"status,omitempty"` // ok | error | timeout | sandbox | missing | sudo
+
 	// BlobHash marks Content as a short preview; the full body lives under the
 	// session blobs/ directory. Provider adapters still send Content only.
 	BlobHash  string `json:"blob_hash,omitempty"`
