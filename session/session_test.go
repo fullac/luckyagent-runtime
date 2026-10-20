@@ -110,6 +110,42 @@ func TestAddProviderMessagePreservesToolCallFields(t *testing.T) {
 	}
 }
 
+func TestAddProviderMessagePreservesToolObservation(t *testing.T) {
+	dir := t.TempDir()
+	s := NewSession("test-tool-observation", dir)
+	started := time.Date(2026, 10, 20, 1, 2, 3, 0, time.UTC)
+	s.AddProviderMessage(provider.Message{
+		Role:       "tool",
+		Content:    "Error: command timed out after 30 seconds",
+		ToolCallID: "call_timeout",
+		Name:       "terminal",
+		RunID:      "run-1",
+		StartedAt:  &started,
+		DurationMS: 30000,
+		Status:     "timeout",
+	})
+
+	if err := s.Save(); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	m, err := NewManager(dir)
+	if err != nil {
+		t.Fatalf("manager: %v", err)
+	}
+	reloaded, ok := m.Get("test-tool-observation")
+	if !ok {
+		t.Fatal("session not found after save")
+	}
+	msgs := reloaded.GetMessages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(msgs))
+	}
+	got := msgs[0]
+	if got.RunID != "run-1" || got.DurationMS != 30000 || got.Status != "timeout" || got.StartedAt == nil || !got.StartedAt.Equal(started) {
+		t.Fatalf("observation not persisted: %#v", got)
+	}
+}
+
 func TestCompactBoundarySplitsPriorRawHistory(t *testing.T) {
 	s := NewSession("test-compact", t.TempDir())
 	s.AddMessage("user", "old raw request")
