@@ -280,7 +280,6 @@ type LimitsConfig struct {
 	MaxTimeoutSeconds      int     `json:"max_timeout_seconds"`
 	MaxToolCalls           int     `json:"max_tool_calls"`
 	MaxConcurrentToolCalls int     `json:"max_concurrent_tool_calls"`
-	MaxLengthContinuations int     `json:"max_length_continuations"`
 }
 
 // RetryConfig 重试配置
@@ -951,7 +950,6 @@ func DefaultConfig() *Config {
 			MaxTimeoutSeconds:      600,
 			MaxToolCalls:           5,
 			MaxConcurrentToolCalls: 3,
-			MaxLengthContinuations: 8,
 		},
 		Retry: RetryConfig{
 			Enabled:            true,
@@ -1365,9 +1363,6 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.Limits.MaxConcurrentToolCalls <= 0 {
 		cfg.Limits.MaxConcurrentToolCalls = def.Limits.MaxConcurrentToolCalls
-	}
-	if cfg.Limits.MaxLengthContinuations <= 0 {
-		cfg.Limits.MaxLengthContinuations = def.Limits.MaxLengthContinuations
 	}
 
 	if cfg.Retry.MaxAttempts <= 0 {
@@ -2834,10 +2829,6 @@ func (m *Manager) Set(key, value string) error {
 		var n int
 		fmt.Sscanf(value, "%d", &n)
 		m.config.Limits.MaxConcurrentToolCalls = n
-	case "limits.max_length_continuations":
-		var n int
-		fmt.Sscanf(value, "%d", &n)
-		m.config.Limits.MaxLengthContinuations = n
 	case "retry.enabled":
 		m.config.Retry.Enabled = parseBool(value)
 	case "retry.max_attempts":
