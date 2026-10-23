@@ -32,33 +32,44 @@ func (s *Session) ensureSegmentDirs() error {
 	return os.MkdirAll(s.blobsDir(), 0700)
 }
 
+// jsonlAppend records where an append landed. Offsets[i] is the file position
+// of messages[i]. Size is the file length after the records and their newlines.
+type jsonlAppend struct {
+	Start   int64
+	Size    int64
+	Offsets []int64
+}
+
 // appendMessagesJSONL appends messages as one JSON object per line.
-// On success it returns the file size after the append.
-func (s *Session) appendMessagesJSONL(messages []provider.Message) (fileSize int64, retErr error) {
+// On success Size is the file length after the append and Offsets holds each
+// new record's starting byte. An empty append returns the current size.
+func (s *Session) appendMessagesJSONL(messages []provider.Message) (result jsonlAppend, retErr error) {
 	if len(messages) == 0 {
 		info, err := os.Stat(s.messagesJSONLPath())
 		if err != nil {
-			return 0, nil
+			return jsonlAppend{}, nil
 		}
-		return info.Size(), nil
+		return jsonlAppend{Start: info.Size(), Size: info.Size()}, nil
 	}
 	if err := s.ensureSegmentDirs(); err != nil {
-		return 0, err
+		return jsonlAppend{}, err
 	}
 	path := s.messagesJSONLPath()
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
-		return 0, fmt.Errorf("open messages jsonl: %w", err)
+		return jsonlAppend{}, fmt.Errorf("open messages jsonl: %w", err)
 	}
 	defer f.Close()
 	if err := prepareJSONLAppend(f); err != nil {
-		return 0, err
+		return jsonlAppend{}, err
 	}
 	info, err := f.Stat()
 	if err != nil {
-		return 0, err
+		return jsonlAppend{}, err
 	}
 	start := info.Size()
+	result.Start = start
+	result.Offsets = make([]int64, len(messages))
 	// Save retries the pending in-memory suffix after a failure. Roll back any
 	// complete records written by this attempt so that retry cannot duplicate it.
 	defer func() {
@@ -74,44 +85,69 @@ func (s *Session) appendMessagesJSONL(messages []provider.Message) (fileSize int
 	w := bufio.NewWriter(f)
 	written := int64(0)
 	for i := range messages {
+		result.Offsets[i] = start + written
 		line, err := json.Marshal(messages[i])
 		if err != nil {
-			return 0, fmt.Errorf("marshal message: %w", err)
+			return jsonlAppend{}, fmt.Errorf("marshal message: %w", err)
 		}
 		n, err := w.Write(line)
 		written += int64(n)
 		if err != nil {
-			return 0, err
+			return jsonlAppend{}, err
 		}
 		if err := w.WriteByte('\n'); err != nil {
-			return 0, err
+			return jsonlAppend{}, err
 		}
 		written++
 	}
 	if err := w.Flush(); err != nil {
-		return 0, err
+		return jsonlAppend{}, err
 	}
 	if err := f.Sync(); err != nil {
-		return 0, err
+		return jsonlAppend{}, err
 	}
-	return start + written, nil
+	result.Size = start + written
+	return result, nil
 }
 
-// rewriteMessagesJSONL replaces the entire jsonl file atomically.
-func (s *Session) rewriteMessagesJSONL(messages []provider.Message) error {
+// jsonlRewrite is a full transcript replacement and the byte position where
+// the latest 500-message window starts inside it.
+type jsonlRewrite struct {
+	Size       int64
+	TailOffset int64
+	TailStart  int
+}
+
+// rewriteMessagesJSONL replaces the entire jsonl file atomically and records
+// the latest window without a second read of the file.
+func (s *Session) rewriteMessagesJSONL(messages []provider.Message) (jsonlRewrite, error) {
 	if err := s.ensureSegmentDirs(); err != nil {
-		return err
+		return jsonlRewrite{}, err
 	}
 	var b strings.Builder
+	window := len(messages) - maxPageCacheMessages
+	if window < 0 {
+		window = 0
+	}
+	var result jsonlRewrite
+	result.TailStart = window
 	for i := range messages {
+		if i == window {
+			result.TailOffset = int64(b.Len())
+		}
 		line, err := json.Marshal(messages[i])
 		if err != nil {
-			return fmt.Errorf("marshal message: %w", err)
+			return jsonlRewrite{}, fmt.Errorf("marshal message: %w", err)
 		}
 		b.Write(line)
 		b.WriteByte('\n')
 	}
-	return utils.WriteFileAtomic(s.messagesJSONLPath(), []byte(b.String()), 0600)
+	payload := []byte(b.String())
+	if err := utils.WriteFileAtomic(s.messagesJSONLPath(), payload, 0600); err != nil {
+		return jsonlRewrite{}, err
+	}
+	result.Size = int64(len(payload))
+	return result, nil
 }
 
 const maxMessageRecordBytes = 8 * 1024 * 1024
@@ -291,6 +327,16 @@ func readMessagesJSONLTail(path string, keep int) ([]provider.Message, int, erro
 }
 
 func countMessagesJSONL(path string) (int, error) {
+	return countMessagesJSONLMode(path, true)
+}
+
+// countReadableMessagesJSONL rejects a damaged record. Callers use it to tell
+// a complete external replacement from a truncated committed message.
+func countReadableMessagesJSONL(path string) (int, error) {
+	return countMessagesJSONLMode(path, false)
+}
+
+func countMessagesJSONLMode(path string, allowIncompleteTail bool) (int, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -300,7 +346,7 @@ func countMessagesJSONL(path string) (int, error) {
 	}
 	defer file.Close()
 	count := 0
-	err = walkMessagesJSONL(file, 0, 1, func(_ provider.Message, _ int64, _ int) error {
+	err = walkMessagesJSONLMode(file, 0, 1, allowIncompleteTail, func(_ provider.Message, _ int64, _ int) error {
 		count++
 		return nil
 	})

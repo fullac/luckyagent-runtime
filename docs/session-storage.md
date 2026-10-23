@@ -84,13 +84,14 @@ context preparation can still load the complete conversation.
 ## Session catalog
 
 `sessions/index.db` is a derived SQLite catalog. It stores the list fields from
-the metadata sidecar, the source file size and modification time, and a byte
-offset for a cold JSONL page. While the transcript fits in the 500-message
-cold page window, that offset is the start of the file and a latest page does
-not scan for record boundaries. A longer transcript leaves the offset empty
-until a cold page rebuilds the in-memory index. It does not store message bodies,
-blobs, or other files from the session directory. The sidecar and transcript
-remain the recovery source.
+the metadata sidecar, the source file size and modification time, and the byte
+offset of the latest 500-message window. Append takes that position from the
+bytes just written. When the window moves into older records, Save reads only
+the messages that left the window, starting at the recorded offset. A cold
+latest page whose file size still matches starts at that offset. It does not
+store message bodies, blobs, or other files from the session directory. The
+sidecar and transcript remain the recovery source. Older databases gain the
+window ordinal through `tail_start`; a missing column is added on open.
 
 Save, SaveMetadata and Delete update the row after the file change succeeds.
 An index write failure does not undo that file change. Startup reads the table
@@ -101,5 +102,12 @@ scan, so sessions stay visible. The database is not a configuration field and
 is separate from the RAG store.
 
 A cold page uses the recorded offset only when the requested range lies inside
-it and the file size still matches. A longer transcript, an older page, or a
-replaced file still scans and rebuilds the in-memory offset index.
+the latest 500 messages and the file size still matches. An older page or a
+damaged record still scans from the head and rebuilds the in-memory offset
+index. A file whose size no longer matches the recorded window is treated as
+an external replacement: the next read drops the offset, scans the replacement,
+and publishes the rebuilt index. A same-size transcript that is shorter than
+the sidecar count still fails instead of hiding a lost message. A full rewrite
+records the new window while it encodes the replacement, so the old byte
+positions are not reused. Legacy Markdown keeps its existing tail cache and
+does not require this offset.

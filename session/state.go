@@ -105,13 +105,14 @@ func (s *Session) publishIndexLocked(meta sessionMetadata, source string) {
 		return
 	}
 	s.mu.RLock()
-	tailOffset, fileSize := s.tailOffset, s.tailSize
+	tailOffset, tailStart, fileSize := s.tailOffset, s.tailStart, s.tailSize
 	s.mu.RUnlock()
 	_ = s.manager.index.Upsert(indexedSession{
 		Meta:       meta,
 		SourceSize: size,
 		SourceTime: mod,
 		TailOffset: tailOffset,
+		TailStart:  tailStart,
 		FileSize:   fileSize,
 	})
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -25,6 +26,7 @@ type indexedSession struct {
 	SourceSize int64
 	SourceTime time.Time
 	TailOffset int64
+	TailStart  int
 	FileSize   int64
 }
 
@@ -61,11 +63,18 @@ func (idx *sessionIndex) init() error {
 			source_size INTEGER NOT NULL DEFAULT 0,
 			source_mtime_ns INTEGER NOT NULL DEFAULT 0,
 			tail_offset INTEGER NOT NULL DEFAULT 0,
+			tail_start INTEGER NOT NULL DEFAULT 0,
 			file_size INTEGER NOT NULL DEFAULT 0
 		);
 		CREATE INDEX IF NOT EXISTS idx_sessions_list ON sessions(pinned, updated_at);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	if _, err = idx.db.Exec(`ALTER TABLE sessions ADD COLUMN tail_start INTEGER NOT NULL DEFAULT 0`); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column") {
+		return err
+	}
+	return nil
 }
 
 func (idx *sessionIndex) Close() error {
@@ -82,7 +91,7 @@ func (idx *sessionIndex) List() (map[string]indexedSession, error) {
 	rows, err := idx.db.Query(`
 		SELECT id, title, agent_role, agent_system_prompt, pinned, project, message_count,
 			created_at, updated_at, byte_size, format, shell_context,
-			source_size, source_mtime_ns, tail_offset, file_size
+			source_size, source_mtime_ns, tail_offset, tail_start, file_size
 		FROM sessions`)
 	if err != nil {
 		return nil, err
@@ -98,7 +107,7 @@ func (idx *sessionIndex) List() (map[string]indexedSession, error) {
 			&row.Meta.ID, &row.Meta.Title, &row.Meta.AgentRole, &row.Meta.AgentSystemPrompt,
 			&pinned, &row.Meta.Project, &row.Meta.MessageCount, &created, &updated,
 			&row.Meta.ByteSize, &row.Meta.Format, &shell,
-			&row.SourceSize, &sourceMTime, &row.TailOffset, &row.FileSize,
+			&row.SourceSize, &sourceMTime, &row.TailOffset, &row.TailStart, &row.FileSize,
 		); err != nil {
 			return nil, err
 		}
@@ -128,8 +137,8 @@ func (idx *sessionIndex) Upsert(row indexedSession) error {
 		INSERT INTO sessions (
 			id, title, agent_role, agent_system_prompt, pinned, project, message_count,
 			created_at, updated_at, byte_size, format, shell_context,
-			source_size, source_mtime_ns, tail_offset, file_size
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_size, source_mtime_ns, tail_offset, tail_start, file_size
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title = excluded.title,
 			agent_role = excluded.agent_role,
@@ -145,13 +154,14 @@ func (idx *sessionIndex) Upsert(row indexedSession) error {
 			source_size = excluded.source_size,
 			source_mtime_ns = excluded.source_mtime_ns,
 			tail_offset = excluded.tail_offset,
+			tail_start = excluded.tail_start,
 			file_size = excluded.file_size
 	`, row.Meta.ID, row.Meta.Title, row.Meta.AgentRole, row.Meta.AgentSystemPrompt,
 		pinned, row.Meta.Project, row.Meta.MessageCount,
 		row.Meta.CreatedAt.UTC().Format(time.RFC3339Nano),
 		row.Meta.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		row.Meta.ByteSize, row.Meta.Format, string(shell),
-		row.SourceSize, row.SourceTime.UnixNano(), row.TailOffset, row.FileSize)
+		row.SourceSize, row.SourceTime.UnixNano(), row.TailOffset, row.TailStart, row.FileSize)
 	return err
 }
 

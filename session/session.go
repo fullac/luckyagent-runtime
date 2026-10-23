@@ -104,9 +104,11 @@ type Session struct {
 	pageCacheTotal int
 	pageCacheValid bool
 	pageIndex      *messagePageIndex
-	// tailOffset is the byte position of the last durable JSONL record. A cold
-	// latest page can start there instead of scanning the file from the head.
+	// tailOffset is the byte position of message tailStart in the durable JSONL.
+	// A cold page inside the latest 500 messages starts there. tailStart is the
+	// message ordinal at that position.
 	tailOffset int64
+	tailStart  int
 	tailSize   int64
 }
 
@@ -611,7 +613,8 @@ func (s *Session) GetMessagesPage(limit, offset int) ([]provider.Message, int, b
 	}
 
 	s.mu.RLock()
-	if s.messagesLoaded {
+	useTail := s.format == FormatSegmentV1 && s.tailSize > 0 && s.pageIndex == nil
+	if s.messagesLoaded && !useTail {
 		total := len(s.Messages)
 		page, ok := selectMessagePage(s.Messages, 0, total, limit, offset)
 		s.mu.RUnlock()
@@ -623,17 +626,31 @@ func (s *Session) GetMessagesPage(limit, offset int) ([]provider.Message, int, b
 	if s.format == FormatSegmentV1 {
 		index := s.pageIndex
 		expected := s.messageCount
-		tailOffset, tailSize := s.tailOffset, s.tailSize
+		tailOffset, tailStart, tailSize := s.tailOffset, s.tailStart, s.tailSize
 		s.mu.RUnlock()
 		s.loadMu.Lock()
 		defer s.loadMu.Unlock()
-		page, total, more, next, err := readMessagesJSONLPageFrom(s.messagesJSONLPath(), limit, offset, index, tailOffset, tailSize, expected)
+		page, total, more, next, err := readMessagesJSONLPageFrom(s.messagesJSONLPath(), limit, offset, index, tailOffset, tailSize, tailStart, expected)
 		if err == nil {
-			if total < expected {
+			// A readable file whose size no longer matches the recorded window
+			// is an external replacement. A damaged or truncated record still
+			// fails the read and keeps the acknowledged message count.
+			replaced := false
+			if tailSize > 0 && total < expected {
+				if info, statErr := os.Stat(s.messagesJSONLPath()); statErr == nil && info.Size() != tailSize {
+					if readable, countErr := countReadableMessagesJSONL(s.messagesJSONLPath()); countErr == nil && readable == total && next != nil {
+						replaced = true
+					}
+				}
+			}
+			if total < expected && !replaced {
 				return nil, 0, false, fmt.Errorf("load session history: found %d messages, expected at least %d persisted messages", total, expected)
 			}
 			s.mu.Lock()
 			s.pageIndex = next
+			if replaced {
+				s.clearTailLocked()
+			}
 			s.messageCount = total
 			s.persistedCount = total
 			s.mu.Unlock()
@@ -884,20 +901,23 @@ func (s *Session) saveLocked() error {
 	}
 
 	var byteSize int64
-	var appendedSize int64
-	var appended bool
+	var appended jsonlAppend
+	var rewritten jsonlRewrite
+	var didAppend, didRewrite bool
 	switch format {
 	case FormatSegmentV1:
 		if needsRewrite || persisted > total {
-			if err := s.rewriteMessagesJSONL(messages); err != nil {
+			written, err := s.rewriteMessagesJSONL(messages)
+			if err != nil {
 				return fmt.Errorf("rewrite segment messages: %w", err)
 			}
+			rewritten, didRewrite = written, true
 		} else if persisted < total {
-			size, err := s.appendMessagesJSONL(messages)
+			written, err := s.appendMessagesJSONL(messages)
 			if err != nil {
 				return fmt.Errorf("append segment messages: %w", err)
 			}
-			appendedSize, appended = size, true
+			appended, didAppend = written, true
 		}
 		byteSize = segmentStorageBytes(s.sessionRootDir())
 		// Drop legacy single-file body after a successful segment write so
@@ -911,6 +931,15 @@ func (s *Session) saveLocked() error {
 		byteSize = fileByteSize(filepath.Join(dir, id+".md"))
 	}
 
+	var tailStart int
+	var tailOffset, tailSize int64
+	var haveTail bool
+	if didRewrite {
+		tailStart, tailOffset, tailSize = rewritten.TailStart, rewritten.TailOffset, rewritten.Size
+		haveTail = true
+	} else if didAppend {
+		tailStart, tailOffset, tailSize, haveTail = s.resolveTail(persisted, appended)
+	}
 	s.mu.Lock()
 	copy(s.Messages[start:], messages)
 	s.messageCount = total
@@ -920,6 +949,17 @@ func (s *Session) saveLocked() error {
 	s.storageBytes = byteSize
 	s.storageBytesValid = true
 	s.invalidatePageCacheLocked()
+	if s.format == FormatSegmentV1 && (didRewrite || didAppend) {
+		if haveTail {
+			s.tailStart = tailStart
+			s.tailOffset = tailOffset
+			s.tailSize = tailSize
+		} else {
+			s.clearTailLocked()
+		}
+	} else if s.format != FormatSegmentV1 {
+		s.clearTailLocked()
+	}
 	s.mu.Unlock()
 
 	meta := sessionMetadata{
@@ -944,28 +984,49 @@ func (s *Session) saveLocked() error {
 	if err := utils.WriteFileAtomic(metaPath, metaData, 0600); err != nil {
 		return fmt.Errorf("write session metadata: %w", err)
 	}
-	s.noteAppendTailLocked(appended, appendedSize, persisted, total, needsRewrite)
 	s.publishIndexLocked(meta, metaPath)
 	return nil
 }
 
-// noteAppendTailLocked requires saveMu. A short transcript records offset 0
-// because its latest page starts at the first record. Once the transcript is
-// longer than the cold page window, Save does not scan for the new window
-// start; the next cold page rebuilds the hint. A rewrite clears it too.
-func (s *Session) noteAppendTailLocked(appended bool, size int64, previous, total int, rewritten bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.format != FormatSegmentV1 || rewritten || total > maxPageCacheMessages {
-		s.tailOffset = 0
-		s.tailSize = 0
-		return
+// resolveTail locates the latest 500-message window after an append. New
+// records contribute their write positions. When the window moves into older
+// records, only the messages that left the window are read from the recorded
+// offset. A gap or a damaged record drops the hint.
+func (s *Session) resolveTail(previous int, written jsonlAppend) (start int, offset, size int64, ok bool) {
+	if len(written.Offsets) == 0 {
+		return 0, 0, 0, false
 	}
-	if !appended {
-		return
+	last := previous + len(written.Offsets) - 1
+	window := last - maxPageCacheMessages + 1
+	if window < 0 {
+		window = 0
 	}
+	if window >= previous {
+		return window, written.Offsets[window-previous], written.Size, true
+	}
+	s.mu.RLock()
+	curStart, curOffset, curSize := s.tailStart, s.tailOffset, s.tailSize
+	s.mu.RUnlock()
+	if window == curStart && curSize == written.Start {
+		return curStart, curOffset, written.Size, true
+	}
+	if window == 0 && curStart == 0 && (curSize == written.Start || curSize == 0) {
+		return 0, 0, written.Size, true
+	}
+	if curSize != written.Start || window < curStart {
+		return 0, 0, 0, false
+	}
+	pos, err := jsonlOffsetAfter(s.messagesJSONLPath(), curOffset, window-curStart)
+	if err != nil {
+		return 0, 0, 0, false
+	}
+	return window, pos, written.Size, true
+}
+
+func (s *Session) clearTailLocked() {
 	s.tailOffset = 0
-	s.tailSize = size
+	s.tailStart = 0
+	s.tailSize = 0
 }
 
 // saveLegacyMarkdown preserves the historical helper signature used by
@@ -1144,6 +1205,7 @@ func (m *Manager) loadFromDisk() error {
 				stub := m.newSessionStub(meta, FormatSegmentV1)
 				if fresh && indexRowFresh(row, size, mod) {
 					stub.tailOffset = row.TailOffset
+					stub.tailStart = row.TailStart
 					stub.tailSize = row.FileSize
 				}
 				m.sessions[meta.ID] = stub

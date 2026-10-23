@@ -2,11 +2,13 @@ package session
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/yurika0211/luckyagent-runtime/provider"
 	"github.com/yurika0211/luckyagent-runtime/utils"
 )
 
@@ -52,15 +54,92 @@ func TestSessionIndexMatchesSidecarAndSurvivesRestart(t *testing.T) {
 	}
 	page, total, more, err := loaded.GetMessagesPage(1, 0)
 	if err != nil || total != 2 || !more || len(page) != 1 || page[0].Content != "second" {
-		t.Fatalf("tail page=%v total=%d more=%v err=%v", page, total, more, err)
+		t.Fatalf("tail page=%v total=%d more=%v err=%v loaded=%v tail=%d/%d/%d", page, total, more, err, loaded.messagesLoaded, loaded.tailOffset, loaded.tailStart, loaded.tailSize)
 	}
 	if loaded.pageIndex != nil {
-		t.Fatal("latest page rebuilt a full offset index")
+		t.Fatalf("latest page rebuilt a full offset index loaded=%v tail=%d/%d/%d index=%v", loaded.messagesLoaded, loaded.tailOffset, loaded.tailStart, loaded.tailSize, loaded.pageIndex != nil)
 	}
 	page, total, _, err = loaded.GetMessagesPage(1, 1)
 	if err != nil || total != 2 || len(page) != 1 || page[0].Content != "first" {
 		t.Fatalf("older page=%v total=%d err=%v", page, total, err)
 	}
+}
+
+func TestLongSessionTailSurvivesRestartAndReplacement(t *testing.T) {
+	dir := t.TempDir()
+	mgr, err := NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sess := mgr.New()
+	const total = maxPageCacheMessages + 40
+	for i := 0; i < total; i++ {
+		sess.AddMessage("user", fmt.Sprintf("message-%05d", i))
+	}
+	if err := sess.Save(); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := mgr.index.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := rows[sess.ID]
+	if row.TailStart != total-maxPageCacheMessages || row.TailOffset <= 0 || row.FileSize <= row.TailOffset {
+		t.Fatalf("window start=%d offset=%d size=%d", row.TailStart, row.TailOffset, row.FileSize)
+	}
+
+	reloaded, err := NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, ok := reloaded.Get(sess.ID)
+	if !ok || loaded.tailStart != row.TailStart || loaded.tailOffset != row.TailOffset {
+		t.Fatalf("reloaded start=%d offset=%d", loaded.tailStart, loaded.tailOffset)
+	}
+	page, count, more, err := loaded.GetMessagesPage(40, 0)
+	if err != nil || count != total || !more || len(page) != 40 || page[0].Content != fmt.Sprintf("message-%05d", total-40) {
+		t.Fatalf("page=%v count=%d more=%v err=%v", pageContents(page), count, more, err)
+	}
+	if loaded.pageIndex != nil {
+		t.Fatalf("latest page scanned the file into an offset index loaded=%v tail=%d/%d/%d", loaded.messagesLoaded, loaded.tailOffset, loaded.tailStart, loaded.tailSize)
+	}
+
+	loaded.AddMessage("assistant", "message-extra")
+	if err := loaded.Save(); err != nil {
+		t.Fatal(err)
+	}
+	if loaded.tailStart != row.TailStart+1 || loaded.tailOffset <= row.TailOffset {
+		t.Fatalf("window did not advance: start=%d offset=%d old=%d", loaded.tailStart, loaded.tailOffset, row.TailOffset)
+	}
+	page, _, _, err = loaded.GetMessagesPage(1, 0)
+	if err != nil || len(page) != 1 || page[0].Content != "message-extra" {
+		t.Fatalf("appended page=%v err=%v", pageContents(page), err)
+	}
+
+	replaced, err := NewManager(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cold, ok := replaced.Get(sess.ID)
+	if !ok {
+		t.Fatal("missing replaced session")
+	}
+	path := cold.messagesJSONLPath()
+	if err := os.WriteFile(path, []byte("{\"role\":\"user\",\"content\":\"replaced\"}\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	page, count, _, err = cold.GetMessagesPage(40, 0)
+	if err != nil || count != 1 || len(page) != 1 || page[0].Content != "replaced" || cold.pageIndex == nil || cold.tailSize != 0 {
+		t.Fatalf("replaced page=%v count=%d index=%v tail=%d err=%v", pageContents(page), count, cold.pageIndex != nil, cold.tailSize, err)
+	}
+}
+
+func pageContents(page []provider.Message) []string {
+	out := make([]string, len(page))
+	for i := range page {
+		out[i] = page[i].Content
+	}
+	return out
 }
 
 func TestSessionIndexCorrectsExternalMetadataAndDelete(t *testing.T) {
