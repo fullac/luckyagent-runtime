@@ -86,8 +86,32 @@ func (s *Session) saveMetadataLocked() error {
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return fmt.Errorf("create session dir: %w", err)
 	}
-	if err := utils.WriteFileAtomic(sessionMetadataPath(dir, meta.ID), data, 0600); err != nil {
+	path := sessionMetadataPath(dir, meta.ID)
+	if err := utils.WriteFileAtomic(path, data, 0600); err != nil {
 		return fmt.Errorf("write session metadata: %w", err)
 	}
+	s.publishIndexLocked(meta, path)
 	return nil
+}
+
+// publishIndexLocked requires saveMu. The sidecar remains the recovery source;
+// a failed index update leaves the next startup to rebuild the row.
+func (s *Session) publishIndexLocked(meta sessionMetadata, source string) {
+	if s.manager == nil || s.manager.index == nil {
+		return
+	}
+	size, mod, ok := sourceFingerprint(source)
+	if !ok {
+		return
+	}
+	s.mu.RLock()
+	tailOffset, fileSize := s.tailOffset, s.tailSize
+	s.mu.RUnlock()
+	_ = s.manager.index.Upsert(indexedSession{
+		Meta:       meta,
+		SourceSize: size,
+		SourceTime: mod,
+		TailOffset: tailOffset,
+		FileSize:   fileSize,
+	})
 }

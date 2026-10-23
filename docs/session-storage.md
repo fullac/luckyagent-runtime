@@ -80,3 +80,26 @@ has at most 8192 offsets and is rebuilt when file identity, size or modification
 time changes. Message history stays unloaded during paging. Legacy Markdown
 keeps the existing bounded tail cache. Full-history operations such as model
 context preparation can still load the complete conversation.
+
+## Session catalog
+
+`sessions/index.db` is a derived SQLite catalog. It stores the list fields from
+the metadata sidecar, the source file size and modification time, and a byte
+offset for a cold JSONL page. While the transcript fits in the 500-message
+cold page window, that offset is the start of the file and a latest page does
+not scan for record boundaries. A longer transcript leaves the offset empty
+until a cold page rebuilds the in-memory index. It does not store message bodies,
+blobs, or other files from the session directory. The sidecar and transcript
+remain the recovery source.
+
+Save, SaveMetadata and Delete update the row after the file change succeeds.
+An index write failure does not undo that file change. Startup reads the table
+when the recorded source fingerprint still matches the file. A changed or
+missing source is read from the file and the row is corrected or removed.
+A missing, corrupt or unreadable database falls back to the existing directory
+scan, so sessions stay visible. The database is not a configuration field and
+is separate from the RAG store.
+
+A cold page uses the recorded offset only when the requested range lies inside
+it and the file size still matches. A longer transcript, an older page, or a
+replaced file still scans and rebuilds the in-memory offset index.
