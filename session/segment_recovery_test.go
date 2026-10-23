@@ -108,7 +108,7 @@ func TestSegmentAppendSeparatesCompleteRecordWithoutNewline(t *testing.T) {
 	if err := os.WriteFile(s.messagesJSONLPath(), []byte(`{"role":"user","content":"first"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.appendMessagesJSONL([]provider.Message{{Role: "assistant", Content: "second"}}); err != nil {
+	if _, err := s.appendMessagesJSONL([]provider.Message{{Role: "assistant", Content: "second"}}); err != nil {
 		t.Fatal(err)
 	}
 	got, err := readAllMessagesJSONL(s.messagesJSONLPath())

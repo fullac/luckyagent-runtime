@@ -2,6 +2,7 @@ package session
 
 import (
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sort"
@@ -32,6 +33,14 @@ type messagePageIndex struct {
 var errMessagePageComplete = errors.New("message page complete")
 
 func readMessagesJSONLPage(path string, limit, offset int, cached *messagePageIndex) ([]provider.Message, int, bool, *messagePageIndex, error) {
+	return readMessagesJSONLPageFrom(path, limit, offset, cached, 0, 0, 0)
+}
+
+// readMessagesJSONLPageFrom can seed a cold latest page from a durable tail
+// offset. tailCount is the message count recorded with that offset. A page
+// that reaches before the tail, or a file whose size no longer matches, scans
+// from the head and rebuilds the index.
+func readMessagesJSONLPageFrom(path string, limit, offset int, cached *messagePageIndex, tailOffset, tailSize int64, tailCount int) ([]provider.Message, int, bool, *messagePageIndex, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, false, nil, err
@@ -43,6 +52,24 @@ func readMessagesJSONLPage(path string, limit, offset int, cached *messagePageIn
 	}
 	index := cached
 	if index == nil || !os.SameFile(index.info, info) || index.info.Size() != info.Size() || !index.info.ModTime().Equal(info.ModTime()) {
+		start := pageStart(tailCount, limit, offset)
+		end := tailCount - offset
+		if end < 0 {
+			end = 0
+		}
+		windowStart := 0
+		if tailCount > maxPageCacheMessages {
+			windowStart = tailCount - maxPageCacheMessages
+		}
+		if cached == nil && tailCount > 0 && tailSize == info.Size() && start >= windowStart && end <= tailCount {
+			page, err := readJSONLRange(f, tailOffset, windowStart, start, end)
+			if err == nil {
+				return page, tailCount, start > 0, nil, nil
+			}
+			if _, seekErr := f.Seek(0, io.SeekStart); seekErr != nil {
+				return nil, 0, false, nil, seekErr
+			}
+		}
 		index = &messagePageIndex{info: info, stride: initialMessageIndexStride}
 		err = walkMessagesJSONL(f, 0, 1, func(_ provider.Message, pos int64, line int) error {
 			if index.total%index.stride == 0 {
@@ -96,4 +123,32 @@ func readMessagesJSONLPage(path string, limit, offset int, cached *messagePageIn
 		return nil, 0, false, nil, err
 	}
 	return page, index.total, start > 0, index, nil
+}
+
+func readJSONLRange(f *os.File, from int64, fromMessage, start, end int) ([]provider.Message, error) {
+	if start < fromMessage || end < start {
+		return nil, fmt.Errorf("jsonl range %d-%d starts before recorded tail %d", start, end, fromMessage)
+	}
+	if _, err := f.Seek(from, io.SeekStart); err != nil {
+		return nil, err
+	}
+	page := make([]provider.Message, 0, end-start)
+	ordinal := fromMessage
+	err := walkMessagesJSONL(f, from, 1, func(msg provider.Message, _ int64, _ int) error {
+		if ordinal >= start {
+			page = append(page, msg)
+		}
+		ordinal++
+		if ordinal == end {
+			return errMessagePageComplete
+		}
+		return nil
+	})
+	if err != nil && !errors.Is(err, errMessagePageComplete) {
+		return nil, err
+	}
+	if ordinal != end {
+		return nil, fmt.Errorf("jsonl tail ended at message %d, recorded range ends at %d", ordinal, end)
+	}
+	return page, nil
 }

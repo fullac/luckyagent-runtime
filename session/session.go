@@ -78,6 +78,7 @@ type Session struct {
 	CreatedAt         time.Time
 	UpdatedAt         time.Time
 	dir               string
+	manager           *Manager
 	deleted           bool
 	storageBytes      int64
 	storageBytesValid bool
@@ -103,6 +104,10 @@ type Session struct {
 	pageCacheTotal int
 	pageCacheValid bool
 	pageIndex      *messagePageIndex
+	// tailOffset is the byte position of the last durable JSONL record. A cold
+	// latest page can start there instead of scanning the file from the head.
+	tailOffset int64
+	tailSize   int64
 }
 
 // ShellContext 保存 shell 会话的环境状态
@@ -618,10 +623,11 @@ func (s *Session) GetMessagesPage(limit, offset int) ([]provider.Message, int, b
 	if s.format == FormatSegmentV1 {
 		index := s.pageIndex
 		expected := s.messageCount
+		tailOffset, tailSize := s.tailOffset, s.tailSize
 		s.mu.RUnlock()
 		s.loadMu.Lock()
 		defer s.loadMu.Unlock()
-		page, total, more, next, err := readMessagesJSONLPage(s.messagesJSONLPath(), limit, offset, index)
+		page, total, more, next, err := readMessagesJSONLPageFrom(s.messagesJSONLPath(), limit, offset, index, tailOffset, tailSize, expected)
 		if err == nil {
 			if total < expected {
 				return nil, 0, false, fmt.Errorf("load session history: found %d messages, expected at least %d persisted messages", total, expected)
@@ -878,6 +884,8 @@ func (s *Session) saveLocked() error {
 	}
 
 	var byteSize int64
+	var appendedSize int64
+	var appended bool
 	switch format {
 	case FormatSegmentV1:
 		if needsRewrite || persisted > total {
@@ -885,9 +893,11 @@ func (s *Session) saveLocked() error {
 				return fmt.Errorf("rewrite segment messages: %w", err)
 			}
 		} else if persisted < total {
-			if err := s.appendMessagesJSONL(messages); err != nil {
+			size, err := s.appendMessagesJSONL(messages)
+			if err != nil {
 				return fmt.Errorf("append segment messages: %w", err)
 			}
+			appendedSize, appended = size, true
 		}
 		byteSize = segmentStorageBytes(s.sessionRootDir())
 		// Drop legacy single-file body after a successful segment write so
@@ -930,10 +940,32 @@ func (s *Session) saveLocked() error {
 	if err != nil {
 		return fmt.Errorf("marshal session metadata: %w", err)
 	}
-	if err := utils.WriteFileAtomic(sessionMetadataPath(dir, id), metaData, 0600); err != nil {
+	metaPath := sessionMetadataPath(dir, id)
+	if err := utils.WriteFileAtomic(metaPath, metaData, 0600); err != nil {
 		return fmt.Errorf("write session metadata: %w", err)
 	}
+	s.noteAppendTailLocked(appended, appendedSize, persisted, total, needsRewrite)
+	s.publishIndexLocked(meta, metaPath)
 	return nil
+}
+
+// noteAppendTailLocked requires saveMu. A short transcript records offset 0
+// because its latest page starts at the first record. Once the transcript is
+// longer than the cold page window, Save does not scan for the new window
+// start; the next cold page rebuilds the hint. A rewrite clears it too.
+func (s *Session) noteAppendTailLocked(appended bool, size int64, previous, total int, rewritten bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.format != FormatSegmentV1 || rewritten || total > maxPageCacheMessages {
+		s.tailOffset = 0
+		s.tailSize = 0
+		return
+	}
+	if !appended {
+		return
+	}
+	s.tailOffset = 0
+	s.tailSize = size
 }
 
 // saveLegacyMarkdown preserves the historical helper signature used by
@@ -1012,6 +1044,7 @@ type Manager struct {
 	mu       sync.RWMutex
 	sessions map[string]*Session
 	dir      string
+	index    *sessionIndex
 }
 
 // NewManager 创建会话管理器
@@ -1024,6 +1057,11 @@ func NewManager(dir string) (*Manager, error) {
 		sessions: make(map[string]*Session),
 		dir:      dir,
 	}
+	if index, err := openSessionIndex(dir); err != nil {
+		fmt.Printf("[session] warning: session index unavailable, scanning files: %v\n", err)
+	} else {
+		m.index = index
+	}
 
 	// 加载已有会话
 	if err := m.loadFromDisk(); err != nil {
@@ -1034,7 +1072,9 @@ func NewManager(dir string) (*Manager, error) {
 	return m, nil
 }
 
-// loadFromDisk 从磁盘加载所有会话（仅元数据，消息按需加载）
+// loadFromDisk 从磁盘加载所有会话（仅元数据，消息按需加载）。
+// A fresh index row stands in for its sidecar. A changed source file is read
+// and the row is corrected. Sessions missing from the index are inserted.
 func (m *Manager) loadFromDisk() error {
 	entries, err := os.ReadDir(m.dir)
 	if err != nil {
@@ -1044,6 +1084,15 @@ func (m *Manager) loadFromDisk() error {
 		return fmt.Errorf("read sessions dir: %w", err)
 	}
 
+	indexed := map[string]indexedSession{}
+	if m.index != nil {
+		loaded, err := m.index.List()
+		if err != nil {
+			fmt.Printf("[session] warning: session index unreadable, scanning files: %v\n", err)
+		} else {
+			indexed = loaded
+		}
+	}
 	seen := make(map[string]struct{})
 
 	// Prefer segment_v1 sessions discovered via meta sidecars or data dirs.
@@ -1055,13 +1104,22 @@ func (m *Manager) loadFromDisk() error {
 				continue
 			}
 			metaPath := filepath.Join(m.dir, name)
-			data, readErr := os.ReadFile(metaPath)
-			if readErr != nil {
+			size, mod, ok := sourceFingerprint(metaPath)
+			if !ok {
 				continue
 			}
+			row, fresh := indexed[id]
 			var meta sessionMetadata
-			if json.Unmarshal(data, &meta) != nil || meta.ID == "" {
-				meta.ID = id
+			if fresh && indexRowFresh(row, size, mod) {
+				meta = row.Meta
+			} else {
+				data, readErr := os.ReadFile(metaPath)
+				if readErr != nil {
+					continue
+				}
+				if json.Unmarshal(data, &meta) != nil || meta.ID == "" {
+					meta.ID = id
+				}
 			}
 			if meta.ID == "" {
 				meta.ID = id
@@ -1082,8 +1140,15 @@ func (m *Manager) loadFromDisk() error {
 						meta.MessageCount = n
 					}
 				}
-				m.sessions[meta.ID] = m.newSessionStub(meta, FormatSegmentV1)
+				meta.Format = FormatSegmentV1
+				stub := m.newSessionStub(meta, FormatSegmentV1)
+				if fresh && indexRowFresh(row, size, mod) {
+					stub.tailOffset = row.TailOffset
+					stub.tailSize = row.FileSize
+				}
+				m.sessions[meta.ID] = stub
 				seen[meta.ID] = struct{}{}
+				m.correctIndex(meta, metaPath, size, mod, stub.tailOffset, stub.tailSize, fresh && indexRowFresh(row, size, mod))
 			}
 			continue
 		}
@@ -1109,8 +1174,15 @@ func (m *Manager) loadFromDisk() error {
 			if meta.ID == "" {
 				meta.ID = name
 			}
+			meta.Format = FormatSegmentV1
 			m.sessions[meta.ID] = m.newSessionStub(meta, FormatSegmentV1)
 			seen[meta.ID] = struct{}{}
+			source := sessionMetadataPath(m.dir, name)
+			size, mod, ok := sourceFingerprint(source)
+			if ok {
+				row, fresh := indexed[meta.ID]
+				m.correctIndex(meta, source, size, mod, 0, 0, fresh && indexRowFresh(row, size, mod))
+			}
 		}
 	}
 
@@ -1124,27 +1196,38 @@ func (m *Manager) loadFromDisk() error {
 		if _, ok := seen[id]; ok {
 			continue
 		}
-		meta, metaOK := readSessionMetadata(m.dir, id, path)
-		if !metaOK {
-			// Legacy installations do not have sidecars yet. The streaming
-			// reader still avoids allocating the complete messages slice.
-			sd, count, readErr := readSessionFile(path, nil)
-			if readErr != nil {
-				continue // 跳过无法解析的文件
-			}
-			meta = sessionMetadata{
-				ID:                sd.ID,
-				Title:             sd.Title,
-				AgentRole:         sd.AgentRole,
-				AgentSystemPrompt: sd.AgentSystemPrompt,
-				Pinned:            sd.Pinned,
-				Project:           sd.Project,
-				ShellContext:      sd.ShellContext,
-				MessageCount:      count,
-				CreatedAt:         sd.CreatedAt,
-				UpdatedAt:         sd.UpdatedAt,
-				ByteSize:          fileByteSize(path),
-				Format:            FormatLegacyMD,
+		size, mod, ok := sourceFingerprint(path)
+		if !ok {
+			continue
+		}
+		row, fresh := indexed[id]
+		var meta sessionMetadata
+		if fresh && indexRowFresh(row, size, mod) && row.Meta.Format == FormatLegacyMD {
+			meta = row.Meta
+		} else {
+			var metaOK bool
+			meta, metaOK = readSessionMetadata(m.dir, id, path)
+			if !metaOK {
+				// Legacy installations do not have sidecars yet. The streaming
+				// reader still avoids allocating the complete messages slice.
+				sd, count, readErr := readSessionFile(path, nil)
+				if readErr != nil {
+					continue // 跳过无法解析的文件
+				}
+				meta = sessionMetadata{
+					ID:                sd.ID,
+					Title:             sd.Title,
+					AgentRole:         sd.AgentRole,
+					AgentSystemPrompt: sd.AgentSystemPrompt,
+					Pinned:            sd.Pinned,
+					Project:           sd.Project,
+					ShellContext:      sd.ShellContext,
+					MessageCount:      count,
+					CreatedAt:         sd.CreatedAt,
+					UpdatedAt:         sd.UpdatedAt,
+					ByteSize:          fileByteSize(path),
+					Format:            FormatLegacyMD,
+				}
 			}
 		}
 		if meta.ID == "" {
@@ -1156,11 +1239,44 @@ func (m *Manager) loadFromDisk() error {
 			seen[meta.ID] = struct{}{}
 			continue
 		}
+		meta.Format = FormatLegacyMD
 		m.sessions[meta.ID] = m.newSessionStub(meta, FormatLegacyMD)
 		seen[meta.ID] = struct{}{}
+		m.correctIndex(meta, path, size, mod, 0, 0, fresh && indexRowFresh(row, size, mod) && row.Meta.Format == FormatLegacyMD)
+	}
+
+	for id := range indexed {
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		// A row whose source file is gone is stale. Keep the row when the
+		// source still exists but this scan skipped it for another reason.
+		if _, _, ok := sourceFingerprint(sessionMetadataPath(m.dir, id)); ok {
+			continue
+		}
+		if _, _, ok := sourceFingerprint(filepath.Join(m.dir, id+".md")); ok {
+			continue
+		}
+		if m.index != nil {
+			_ = m.index.Delete(id)
+		}
 	}
 
 	return nil
+}
+
+func (m *Manager) correctIndex(meta sessionMetadata, source string, size int64, mod time.Time, tailOffset, fileSize int64, fresh bool) {
+	if m == nil || m.index == nil || fresh {
+		return
+	}
+	_ = m.index.Upsert(indexedSession{
+		Meta:       meta,
+		SourceSize: size,
+		SourceTime: mod,
+		TailOffset: tailOffset,
+		FileSize:   fileSize,
+	})
+	_ = source
 }
 
 func (m *Manager) newSessionStub(meta sessionMetadata, format string) *Session {
@@ -1188,6 +1304,7 @@ func (m *Manager) newSessionStub(meta sessionMetadata, format string) *Session {
 		CreatedAt:         meta.CreatedAt,
 		UpdatedAt:         meta.UpdatedAt,
 		dir:               m.dir,
+		manager:           m,
 		ShellContext:      meta.ShellContext,
 		format:            format,
 		messagesLoaded:    false,
@@ -1560,6 +1677,7 @@ func (m *Manager) New() *Session {
 
 	id := m.nextSessionIDLocked("")
 	s := NewSession(id, m.dir)
+	s.manager = m
 	s.messagesLoaded = true // 新会话消息已在内存
 	s.messageCount = 0
 	m.sessions[id] = s
@@ -1594,6 +1712,7 @@ func (m *Manager) Ensure(id string) *Session {
 	}
 
 	s := NewSession(id, m.dir)
+	s.manager = m
 	s.messagesLoaded = true
 	s.messageCount = 0
 	m.sessions[id] = s
@@ -1795,6 +1914,11 @@ func (m *Manager) Delete(id string) error {
 	s.mu.Unlock()
 
 	delete(m.sessions, id)
+	// The files are already gone. A stale index row is removed on the next
+	// startup scan, so an index failure does not report a failed deletion.
+	if m.index != nil {
+		_ = m.index.Delete(id)
+	}
 	return nil
 }
 
@@ -1845,6 +1969,7 @@ func (m *Manager) Upsert(s *Session) {
 	if !knownSize {
 		s.refreshStorageBytesLocked()
 	}
+	s.manager = m
 	m.sessions[s.ID] = s
 }
 

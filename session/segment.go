@@ -33,26 +33,32 @@ func (s *Session) ensureSegmentDirs() error {
 }
 
 // appendMessagesJSONL appends messages as one JSON object per line.
-func (s *Session) appendMessagesJSONL(messages []provider.Message) (retErr error) {
+// On success it returns the file size after the append.
+func (s *Session) appendMessagesJSONL(messages []provider.Message) (fileSize int64, retErr error) {
 	if len(messages) == 0 {
-		return nil
+		info, err := os.Stat(s.messagesJSONLPath())
+		if err != nil {
+			return 0, nil
+		}
+		return info.Size(), nil
 	}
 	if err := s.ensureSegmentDirs(); err != nil {
-		return err
+		return 0, err
 	}
 	path := s.messagesJSONLPath()
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0600)
 	if err != nil {
-		return fmt.Errorf("open messages jsonl: %w", err)
+		return 0, fmt.Errorf("open messages jsonl: %w", err)
 	}
 	defer f.Close()
 	if err := prepareJSONLAppend(f); err != nil {
-		return err
+		return 0, err
 	}
 	info, err := f.Stat()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	start := info.Size()
 	// Save retries the pending in-memory suffix after a failure. Roll back any
 	// complete records written by this attempt so that retry cannot duplicate it.
 	defer func() {
@@ -66,22 +72,29 @@ func (s *Session) appendMessagesJSONL(messages []provider.Message) (retErr error
 	}()
 
 	w := bufio.NewWriter(f)
+	written := int64(0)
 	for i := range messages {
 		line, err := json.Marshal(messages[i])
 		if err != nil {
-			return fmt.Errorf("marshal message: %w", err)
+			return 0, fmt.Errorf("marshal message: %w", err)
 		}
-		if _, err := w.Write(line); err != nil {
-			return err
+		n, err := w.Write(line)
+		written += int64(n)
+		if err != nil {
+			return 0, err
 		}
 		if err := w.WriteByte('\n'); err != nil {
-			return err
+			return 0, err
 		}
+		written++
 	}
 	if err := w.Flush(); err != nil {
-		return err
+		return 0, err
 	}
-	return f.Sync()
+	if err := f.Sync(); err != nil {
+		return 0, err
+	}
+	return start + written, nil
 }
 
 // rewriteMessagesJSONL replaces the entire jsonl file atomically.
