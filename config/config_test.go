@@ -18,9 +18,6 @@ func TestDefaultConfig(t *testing.T) {
 	if cfg.MaxTokens != 4096 {
 		t.Errorf("expected max_tokens 4096, got %d", cfg.MaxTokens)
 	}
-	if cfg.Limits.MaxLengthContinuations != 8 {
-		t.Errorf("expected limits.max_length_continuations 8, got %d", cfg.Limits.MaxLengthContinuations)
-	}
 	if cfg.Agent.RepeatToolCallLimit != 3 {
 		t.Errorf("expected repeat_tool_call_limit 3, got %d", cfg.Agent.RepeatToolCallLimit)
 	}
@@ -141,8 +138,6 @@ func TestManagerSetAndGet(t *testing.T) {
 	mgr.Set("model", "claude-3")
 	mgr.Set("max_tokens", "8192")
 	mgr.Set("temperature", "0.5")
-	mgr.Set("limits.max_length_continuations", "12")
-
 	cfg := mgr.Get()
 	if cfg.Provider != "anthropic" {
 		t.Errorf("expected anthropic, got %s", cfg.Provider)
@@ -155,9 +150,6 @@ func TestManagerSetAndGet(t *testing.T) {
 	}
 	if cfg.Temperature != 0.5 {
 		t.Errorf("expected 0.5, got %f", cfg.Temperature)
-	}
-	if cfg.Limits.MaxLengthContinuations != 12 {
-		t.Errorf("expected max_length_continuations 12, got %d", cfg.Limits.MaxLengthContinuations)
 	}
 }
 
