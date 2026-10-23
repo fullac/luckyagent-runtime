@@ -257,6 +257,32 @@ func TestCircuitBreakerMiddleware(t *testing.T) {
 	}
 }
 
+func TestMiddlewareProviderCircuitStatus(t *testing.T) {
+	inner := &failingMockProvider{}
+	mw := NewCircuitBreakerMiddleware(resilience.CircuitBreakerConfig{
+		FailureThreshold: 1,
+		Timeout:          time.Minute,
+	})
+	wrapped := NewMiddlewareProvider(inner, NewChain(mw))
+	state, failures := wrapped.CircuitStatus()
+	if state != "Closed" || failures != 0 {
+		t.Fatalf("state=%s failures=%d", state, failures)
+	}
+	if _, err := wrapped.Chat(context.Background(), nil); err == nil {
+		t.Fatal("expected upstream failure")
+	}
+	state, failures = wrapped.CircuitStatus()
+	if state != "Open" || failures != 1 {
+		t.Fatalf("state=%s failures=%d", state, failures)
+	}
+}
+
+type failingMockProvider struct{ mockProvider }
+
+func (m *failingMockProvider) Chat(context.Context, []provider.Message) (*provider.Response, error) {
+	return nil, fmt.Errorf("upstream failed")
+}
+
 func TestRateLimitMiddleware(t *testing.T) {
 	mw := NewRateLimitMiddleware(2, 1*time.Second)
 	if mw.Name() != "rate-limit" {

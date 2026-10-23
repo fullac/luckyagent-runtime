@@ -270,8 +270,9 @@ type (
 
 // Registry 管理所有已注册的 Provider
 type Registry struct {
-	providers map[string]Provider
-	factories map[string]func(Config) Provider
+	providers      map[string]Provider
+	factories      map[string]func(Config) Provider
+	nodeResilience NodeResilience
 }
 
 // NewRegistry 创建 Provider 注册表

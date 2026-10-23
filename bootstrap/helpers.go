@@ -206,18 +206,8 @@ func WrapProviderWithMiddleware(p provider.Provider, c *config.Config) provider.
 		chain.Use(middleware.NewRetryMiddlewareWithPredicate(retryCfg, RetryPredicateFromConfig(c.Retry)))
 	}
 
-	if c.CircuitBreaker.Enabled {
-		cbCfg := resilience.DefaultCircuitBreakerConfig()
-		if c.CircuitBreaker.ErrorThreshold > 0 {
-			cbCfg.FailureThreshold = c.CircuitBreaker.ErrorThreshold
-		}
-		if c.CircuitBreaker.TimeoutSeconds > 0 {
-			cbCfg.Timeout = time.Duration(c.CircuitBreaker.TimeoutSeconds) * time.Second
-		}
-		if c.CircuitBreaker.HalfOpenMaxReqs > 0 {
-			cbCfg.HalfOpenMaxReqs = c.CircuitBreaker.HalfOpenMaxReqs
-		}
-		chain.Use(middleware.NewCircuitBreakerMiddleware(cbCfg))
+	if c.CircuitBreaker.Enabled && !providerIsFallback(p) {
+		chain.Use(middleware.NewCircuitBreakerMiddleware(circuitBreakerConfig(c)))
 	}
 
 	if c.RateLimit.Enabled {
@@ -232,6 +222,28 @@ func WrapProviderWithMiddleware(p provider.Provider, c *config.Config) provider.
 		return p
 	}
 	return middleware.NewMiddlewareProvider(p, chain)
+}
+
+func providerIsFallback(p provider.Provider) bool {
+	_, ok := p.(*provider.FallbackChain)
+	return ok
+}
+
+func circuitBreakerConfig(c *config.Config) resilience.CircuitBreakerConfig {
+	cbCfg := resilience.DefaultCircuitBreakerConfig()
+	if c == nil {
+		return cbCfg
+	}
+	if c.CircuitBreaker.ErrorThreshold > 0 {
+		cbCfg.FailureThreshold = c.CircuitBreaker.ErrorThreshold
+	}
+	if c.CircuitBreaker.TimeoutSeconds > 0 {
+		cbCfg.Timeout = time.Duration(c.CircuitBreaker.TimeoutSeconds) * time.Second
+	}
+	if c.CircuitBreaker.HalfOpenMaxReqs > 0 {
+		cbCfg.HalfOpenMaxReqs = c.CircuitBreaker.HalfOpenMaxReqs
+	}
+	return cbCfg
 }
 
 func RetryPredicateFromConfig(cfg config.RetryConfig) resilience.IsRetryableFunc {
@@ -294,6 +306,14 @@ func InitSoulRuntime(c *config.Config) SoulRuntime {
  */
 func InitProviderRuntime(cfg *config.Manager, c *config.Config) (ProviderRuntime, error) {
 	registry := provider.NewRegistry()
+	if c.CircuitBreaker.Enabled {
+		cbCfg := circuitBreakerConfig(c)
+		registry.SetNodeResilience(func(p provider.Provider) provider.Provider {
+			chain := middleware.NewChain()
+			chain.Use(middleware.NewCircuitBreakerMiddleware(cbCfg))
+			return middleware.NewMiddlewareProvider(p, chain)
+		})
+	}
 	catalog := provider.NewModelCatalog()
 
 	// 加载自定义模型

@@ -354,6 +354,12 @@ func (m *CircuitBreakerMiddleware) InterceptChatStream(ctx context.Context, info
 	return ch, err
 }
 
+// CircuitStatus reports the breaker state and consecutive failures.
+func (m *CircuitBreakerMiddleware) CircuitStatus() (string, int) {
+	stats := m.cb.Stats()
+	return stats.State.String(), stats.ConsecutiveFailures
+}
+
 // --- RateLimitMiddleware ---
 
 // RateLimitMiddleware limits the rate of Provider calls.
@@ -448,6 +454,17 @@ func providerModel(p provider.Provider) string {
 // Chain returns the middleware chain.
 func (mp *MiddlewareProvider) Chain() *Chain {
 	return mp.chain
+}
+
+// CircuitStatus reports the breaker attached to this wrapped provider.
+// An unwrapped provider has no breaker of its own.
+func (mp *MiddlewareProvider) CircuitStatus() (string, int) {
+	for _, mw := range mp.chain.middlewares {
+		if breaker, ok := mw.(interface{ CircuitStatus() (string, int) }); ok {
+			return breaker.CircuitStatus()
+		}
+	}
+	return "", 0
 }
 
 // Chat sends a message through the middleware chain.

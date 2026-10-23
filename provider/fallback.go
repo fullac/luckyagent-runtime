@@ -2,12 +2,19 @@ package provider
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"log"
 	"strings"
 	"sync"
 	"time"
 )
+
+// modelErrorCooldown is how long a model-level 404 stays out of the chain
+// before one probe. Account groups can start serving that model again, so
+// the node is not closed for the process lifetime.
+const modelErrorCooldown = 30 * time.Minute
 
 // FallbackConfig 定义降级链中一个节点的配置
 type FallbackConfig struct {
@@ -26,14 +33,45 @@ type FallbackConfig struct {
 // 当 primary 失败时自动切换到下一个 provider
 type FallbackChain struct {
 	chain      []Provider
+	nodes      []fallbackNode
 	mu         sync.RWMutex
 	active     int // 当前活跃的 provider 索引
 	failCounts []int
-	disabled   []bool        // 配置类永久错误后禁用，直到显式重置或重建链
 	maxFails   int           // 连续失败多少次后降级
 	cooldown   time.Duration // 降级冷却时间
 	cooldownAt []time.Time   // 每个 provider 的冷却截止时间
+	modelError []bool        // 冷却来自模型级错误，到期后只放行一次探测
 	onSwitch   func(from, to string)
+	now        func() time.Time
+	modelCool  time.Duration
+}
+
+type fallbackNode struct {
+	name       string
+	model      string
+	endpoint   string
+	credential string
+}
+
+// NodeStatus is one fallback entry as exposed to health checks.
+type NodeStatus struct {
+	Index           int    `json:"index"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	Endpoint        string `json:"endpoint"`
+	Credential      string `json:"credential"`
+	Available       bool   `json:"available"`
+	FailCount       int    `json:"fail_count"`
+	CooldownUntil   string `json:"cooldown_until,omitempty"`
+	ModelError      bool   `json:"model_error"`
+	CircuitState    string `json:"circuit_state,omitempty"`
+	CircuitFailures int    `json:"circuit_failures,omitempty"`
+}
+
+// ChainStatus is the fallback chain snapshot used by health and readiness.
+type ChainStatus struct {
+	ActiveIndex int          `json:"active_index"`
+	Nodes       []NodeStatus `json:"nodes"`
 }
 
 // NewFallbackChain 创建降级链
@@ -43,9 +81,10 @@ func NewFallbackChain(configs []FallbackConfig, registry *Registry) (*FallbackCh
 	}
 
 	chain := make([]Provider, 0, len(configs))
+	nodes := make([]fallbackNode, 0, len(configs))
 	failCounts := make([]int, len(configs))
-	disabled := make([]bool, len(configs))
 	cooldownAt := make([]time.Time, len(configs))
+	modelError := make([]bool, len(configs))
 
 	for _, fc := range configs {
 		name := strings.TrimSpace(fc.Name)
@@ -68,17 +107,92 @@ func NewFallbackChain(configs []FallbackConfig, registry *Registry) (*FallbackCh
 		if err != nil {
 			return nil, fmt.Errorf("resolve provider %s: %w", name, err)
 		}
+		if wrapped := wrapNodeResilience(p, registry); wrapped != nil {
+			p = wrapped
+		}
 		chain = append(chain, p)
+		nodes = append(nodes, fallbackNode{
+			name:       name,
+			model:      strings.TrimSpace(fc.Model),
+			endpoint:   strings.TrimRight(strings.TrimSpace(fc.APIBase), "/"),
+			credential: credentialLabel(fc.APIKey),
+		})
 	}
 
 	return &FallbackChain{
 		chain:      chain,
+		nodes:      nodes,
 		failCounts: failCounts,
-		disabled:   disabled,
 		cooldownAt: cooldownAt,
+		modelError: modelError,
 		maxFails:   3,
 		cooldown:   5 * time.Minute,
+		modelCool:  modelErrorCooldown,
+		now:        time.Now,
 	}, nil
+}
+
+// NodeResilience wraps one fallback entry with its own middleware.
+// The chain installs this so a breaker counts failures of that model and
+// endpoint, not of the whole fallback chain.
+type NodeResilience func(Provider) Provider
+
+// SetNodeResilience installs the per-node wrapper used by later chains.
+// Tests and hosts that do not configure a breaker leave nodes unwrapped.
+func (r *Registry) SetNodeResilience(wrap NodeResilience) {
+	if r == nil {
+		return
+	}
+	r.nodeResilience = wrap
+}
+
+func wrapNodeResilience(p Provider, registry *Registry) Provider {
+	if registry == nil || registry.nodeResilience == nil || p == nil {
+		return p
+	}
+	wrapped := registry.nodeResilience(p)
+	if wrapped == nil {
+		return p
+	}
+	return wrapped
+}
+
+func credentialLabel(apiKey string) string {
+	trimmed := strings.TrimSpace(apiKey)
+	if trimmed == "" {
+		return "none"
+	}
+	sum := sha256.Sum256([]byte(trimmed))
+	return hex.EncodeToString(sum[:4])
+}
+
+func (fc *FallbackChain) clock() time.Time {
+	if fc.now != nil {
+		return fc.now()
+	}
+	return time.Now()
+}
+
+func (n fallbackNode) label() string {
+	model := n.model
+	if model == "" {
+		model = "-"
+	}
+	endpoint := n.endpoint
+	if endpoint == "" {
+		endpoint = "-"
+	}
+	return fmt.Sprintf("%s model=%s endpoint=%s credential=%s", n.name, model, endpoint, n.credential)
+}
+
+func (fc *FallbackChain) nodeLabel(idx int) string {
+	if idx < 0 || idx >= len(fc.nodes) {
+		if idx >= 0 && idx < len(fc.chain) {
+			return fc.chain[idx].Name()
+		}
+		return fmt.Sprintf("index %d", idx)
+	}
+	return fc.nodes[idx].label()
 }
 
 // Name 返回当前活跃 provider 的名称
@@ -152,7 +266,7 @@ func (fc *FallbackChain) Chat(ctx context.Context, messages []Message) (*Respons
 			if !fc.shouldTryNextProvider(i, err) {
 				return nil, err
 			}
-			log.Printf("[fallback] provider %s failed: %v, trying next", fc.chain[i].Name(), err)
+			log.Printf("[fallback] %s failed: %v, trying next", fc.nodeLabel(i), err)
 			continue
 		}
 
@@ -183,7 +297,7 @@ func (fc *FallbackChain) ChatStream(ctx context.Context, messages []Message) (<-
 			if !fc.shouldTryNextProvider(i, err) {
 				return nil, err
 			}
-			log.Printf("[fallback] provider %s stream failed: %v, trying next", fc.chain[i].Name(), err)
+			log.Printf("[fallback] %s stream failed: %v, trying next", fc.nodeLabel(i), err)
 			continue
 		}
 
@@ -201,14 +315,18 @@ func fallbackChainError(chainLen int, lastErr error) error {
 	return fmt.Errorf("all %d providers failed in fallback chain", chainLen)
 }
 
-// shouldDisableProviderOnError identifies configuration failures that will not
-// recover by retrying the same provider instance.
-func shouldDisableProviderOnError(err error) bool {
+// isModelLevelError reports a failure of this model on an otherwise reachable
+// provider. The same provider's other models stay usable, and the node is
+// cooled down instead of closed for the process lifetime.
+func isModelLevelError(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
 	if strings.Contains(msg, "model_not_found") || strings.Contains(msg, "model not found") {
+		return true
+	}
+	if strings.Contains(msg, "not supported by any configured account") {
 		return true
 	}
 	for _, marker := range []string{
@@ -223,15 +341,51 @@ func shouldDisableProviderOnError(err error) bool {
 }
 
 func (fc *FallbackChain) shouldTryNextProvider(idx int, err error) bool {
-	if shouldDisableProviderOnError(err) {
-		fc.disableProvider(idx, err)
-		return true
+	if isModelLevelError(err) {
+		fc.coolModel(idx, err)
+		return fc.hasDifferentModel(idx)
 	}
 	if !shouldFallbackOnError(err) {
 		return false
 	}
+	if fc.sharesEndpoint(idx) {
+		fc.recordSharedFailure(idx, err)
+		return false
+	}
 	fc.recordFailure(idx, err)
 	return true
+}
+
+// sharesEndpoint reports whether a later node uses the same address and
+// credential. Site-wide failures stay on the current node in that case.
+func (fc *FallbackChain) sharesEndpoint(idx int) bool {
+	if idx < 0 || idx >= len(fc.nodes) {
+		return false
+	}
+	current := fc.nodes[idx]
+	if current.endpoint == "" {
+		return false
+	}
+	for i := idx + 1; i < len(fc.nodes); i++ {
+		next := fc.nodes[i]
+		if next.endpoint == current.endpoint && next.credential == current.credential {
+			return true
+		}
+	}
+	return false
+}
+
+func (fc *FallbackChain) hasDifferentModel(idx int) bool {
+	if idx < 0 || idx >= len(fc.nodes) {
+		return true
+	}
+	current := fc.nodes[idx].model
+	for i := idx + 1; i < len(fc.nodes); i++ {
+		if fc.nodes[i].model != current {
+			return true
+		}
+	}
+	return false
 }
 
 func shouldFallbackOnError(err error) bool {
@@ -266,7 +420,7 @@ func (fc *FallbackChain) Validate() error {
 	hasValid := false
 	for i, p := range fc.chain {
 		if err := p.Validate(); err != nil {
-			log.Printf("[fallback] provider %s invalid: %v", p.Name(), err)
+			log.Printf("[fallback] %s invalid: %v", fc.nodeLabel(i), err)
 			continue
 		}
 		hasValid = true
@@ -283,8 +437,8 @@ func (fc *FallbackChain) nextAvailable() int {
 	fc.mu.RLock()
 	defer fc.mu.RUnlock()
 
-	// 每个新请求都从最高优先级开始。处于冷却或因配置错误被禁用的
-	// 节点会被跳过；冷却结束后主节点会自然获得一次恢复探测。
+	// 每个新请求都从最高优先级开始。冷却中的节点会被跳过；普通冷却
+	// 结束后主节点获得一次恢复探测。模型级冷却到期后只放行一次探测。
 	for i := 0; i < len(fc.chain); i++ {
 		if fc.isAvailableLocked(i) {
 			return i
@@ -305,45 +459,49 @@ func (fc *FallbackChain) isAvailableLocked(idx int) bool {
 	if idx < 0 || idx >= len(fc.chain) {
 		return false
 	}
-	if fc.disabled[idx] {
-		return false
-	}
-	// 冷却期内不可用
-	if !fc.cooldownAt[idx].IsZero() && time.Now().Before(fc.cooldownAt[idx]) {
+	if !fc.cooldownAt[idx].IsZero() && fc.clock().Before(fc.cooldownAt[idx]) {
 		return false
 	}
 	return true
 }
 
-// disableProvider marks a provider unavailable for the lifetime of this
-// chain. Configuration reloads rebuild the chain; reset methods also allow an
-// explicit in-process recovery.
-func (fc *FallbackChain) disableProvider(idx int, err error) {
+// coolModel parks one model after a model-level error. A later node with a
+// different model may still be tried. The cooldown expires into a single probe.
+func (fc *FallbackChain) coolModel(idx int, err error) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 	if idx < 0 || idx >= len(fc.chain) {
 		return
 	}
 
-	fc.disabled[idx] = true
-	log.Printf("[fallback] provider %s disabled after permanent error: %v", fc.chain[idx].Name(), err)
-	if idx != fc.active {
+	cool := fc.modelCool
+	if cool <= 0 {
+		cool = modelErrorCooldown
+	}
+	fc.modelError[idx] = true
+	fc.failCounts[idx] = 0
+	fc.cooldownAt[idx] = fc.clock().Add(cool)
+	log.Printf("[fallback] %s model cooldown for %v after: %v", fc.nodeLabel(idx), cool, err)
+	fc.switchAwayLocked(idx)
+}
+
+// recordSharedFailure counts a site-wide error without moving to another
+// model that uses the same address and credential.
+func (fc *FallbackChain) recordSharedFailure(idx int, err error) {
+	fc.mu.Lock()
+	defer fc.mu.Unlock()
+	if idx < 0 || idx >= len(fc.chain) {
 		return
 	}
 
-	for i := 0; i < len(fc.chain); i++ {
-		if !fc.isAvailableLocked(i) {
-			continue
-		}
-		oldName := fc.chain[idx].Name()
-		fc.active = i
-		newName := fc.chain[i].Name()
-		log.Printf("[fallback] switching from %s to %s", oldName, newName)
-		if fc.onSwitch != nil {
-			go fc.onSwitch(oldName, newName)
-		}
+	fc.modelError[idx] = false
+	fc.failCounts[idx]++
+	log.Printf("[fallback] %s shared endpoint failure %d/%d: %v", fc.nodeLabel(idx), fc.failCounts[idx], fc.maxFails, err)
+	if fc.failCounts[idx] < fc.maxFails {
 		return
 	}
+	fc.cooldownAt[idx] = fc.clock().Add(fc.cooldown)
+	log.Printf("[fallback] %s entering cooldown for %v", fc.nodeLabel(idx), fc.cooldown)
 }
 
 // recordFailure 记录失败
@@ -351,30 +509,34 @@ func (fc *FallbackChain) recordFailure(idx int, err error) {
 	fc.mu.Lock()
 	defer fc.mu.Unlock()
 
+	fc.modelError[idx] = false
 	fc.failCounts[idx]++
-	log.Printf("[fallback] provider %s fail count: %d/%d", fc.chain[idx].Name(), fc.failCounts[idx], fc.maxFails)
+	log.Printf("[fallback] %s fail count: %d/%d", fc.nodeLabel(idx), fc.failCounts[idx], fc.maxFails)
 
 	if fc.failCounts[idx] >= fc.maxFails {
-		// 设置冷却
-		fc.cooldownAt[idx] = time.Now().Add(fc.cooldown)
-		log.Printf("[fallback] provider %s entering cooldown for %v", fc.chain[idx].Name(), fc.cooldown)
+		fc.cooldownAt[idx] = fc.clock().Add(fc.cooldown)
+		log.Printf("[fallback] %s entering cooldown for %v", fc.nodeLabel(idx), fc.cooldown)
+		fc.switchAwayLocked(idx)
+	}
+}
 
-		// 如果是当前 active，切换到下一个
-		if idx == fc.active {
-			oldName := fc.chain[idx].Name()
-			for i := idx + 1; i < len(fc.chain); i++ {
-				if fc.isAvailableLocked(i) {
-					fc.active = i
-					newName := fc.chain[i].Name()
-					log.Printf("[fallback] switching from %s to %s", oldName, newName)
-					cb := fc.onSwitch // read under lock
-					if cb != nil {
-						go cb(oldName, newName)
-					}
-					break
-				}
-			}
+func (fc *FallbackChain) switchAwayLocked(idx int) {
+	if idx != fc.active {
+		return
+	}
+	oldName := fc.nodeLabel(idx)
+	for i := 0; i < len(fc.chain); i++ {
+		if i == idx || !fc.isAvailableLocked(i) {
+			continue
 		}
+		fc.active = i
+		newName := fc.nodeLabel(i)
+		log.Printf("[fallback] switching from %s to %s", oldName, newName)
+		if fc.onSwitch != nil {
+			from, to := oldName, newName
+			go fc.onSwitch(from, to)
+		}
+		return
 	}
 }
 
@@ -384,27 +546,23 @@ func (fc *FallbackChain) recordSuccess(idx int) {
 	defer fc.mu.Unlock()
 
 	fc.failCounts[idx] = 0
-	fc.cooldownAt[idx] = time.Time{} // 清除冷却
+	fc.modelError[idx] = false
+	fc.cooldownAt[idx] = time.Time{}
 
-	// 如果成功的不在 active 位置，切换回来（优先使用更靠前的 provider）
-	if idx < fc.active {
-		oldName := fc.chain[fc.active].Name()
-		fc.active = idx
-		newName := fc.chain[idx].Name()
+	if idx == fc.active {
+		return
+	}
+	oldName := fc.nodeLabel(fc.active)
+	higher := idx < fc.active
+	fc.active = idx
+	newName := fc.nodeLabel(idx)
+	if higher {
 		log.Printf("[fallback] switching back from %s to %s (higher priority)", oldName, newName)
-		cb := fc.onSwitch
-		if cb != nil {
-			go cb(oldName, newName)
-		}
-	} else if idx != fc.active {
-		oldName := fc.chain[fc.active].Name()
-		fc.active = idx
-		newName := fc.chain[idx].Name()
+	} else {
 		log.Printf("[fallback] switching from %s to %s", oldName, newName)
-		cb := fc.onSwitch
-		if cb != nil {
-			go cb(oldName, newName)
-		}
+	}
+	if fc.onSwitch != nil {
+		go fc.onSwitch(oldName, newName)
 	}
 }
 
@@ -414,7 +572,7 @@ func (fc *FallbackChain) ResetCooldown(idx int) {
 	defer fc.mu.Unlock()
 	if idx >= 0 && idx < len(fc.chain) {
 		fc.failCounts[idx] = 0
-		fc.disabled[idx] = false
+		fc.modelError[idx] = false
 		fc.cooldownAt[idx] = time.Time{}
 	}
 }
@@ -425,10 +583,45 @@ func (fc *FallbackChain) ResetAllCooldowns() {
 	defer fc.mu.Unlock()
 	for i := range fc.chain {
 		fc.failCounts[i] = 0
-		fc.disabled[i] = false
+		fc.modelError[i] = false
 		fc.cooldownAt[i] = time.Time{}
 	}
 	fc.active = 0
+}
+
+// Status returns each node's identity and cooldown without secrets.
+func (fc *FallbackChain) Status() ChainStatus {
+	fc.mu.RLock()
+	defer fc.mu.RUnlock()
+
+	status := ChainStatus{
+		ActiveIndex: fc.active,
+		Nodes:       make([]NodeStatus, len(fc.chain)),
+	}
+	for i := range fc.chain {
+		node := fallbackNode{}
+		if i < len(fc.nodes) {
+			node = fc.nodes[i]
+		}
+		item := NodeStatus{
+			Index:      i,
+			Provider:   node.name,
+			Model:      node.model,
+			Endpoint:   node.endpoint,
+			Credential: node.credential,
+			Available:  fc.isAvailableLocked(i),
+			FailCount:  fc.failCounts[i],
+			ModelError: fc.modelError[i],
+		}
+		if !fc.cooldownAt[i].IsZero() && fc.clock().Before(fc.cooldownAt[i]) {
+			item.CooldownUntil = fc.cooldownAt[i].UTC().Format(time.RFC3339)
+		}
+		if breaker, ok := fc.chain[i].(interface{ CircuitStatus() (string, int) }); ok {
+			item.CircuitState, item.CircuitFailures = breaker.CircuitStatus()
+		}
+		status.Nodes[i] = item
+	}
+	return status
 }
 
 // Ensure FallbackChain implements Provider and FunctionCallingProvider
@@ -458,7 +651,7 @@ func (fc *FallbackChain) ChatWithOptions(ctx context.Context, messages []Message
 				if !fc.shouldTryNextProvider(i, err) {
 					return nil, err
 				}
-				log.Printf("[fallback] provider %s ChatWithOptions failed: %v, trying next", p.Name(), err)
+				log.Printf("[fallback] %s ChatWithOptions failed: %v, trying next", fc.nodeLabel(i), err)
 				continue
 			}
 			fc.recordSuccess(i)
@@ -472,7 +665,7 @@ func (fc *FallbackChain) ChatWithOptions(ctx context.Context, messages []Message
 			if !fc.shouldTryNextProvider(i, err) {
 				return nil, err
 			}
-			log.Printf("[fallback] provider %s Chat failed: %v, trying next", p.Name(), err)
+			log.Printf("[fallback] %s Chat failed: %v, trying next", fc.nodeLabel(i), err)
 			continue
 		}
 		fc.recordSuccess(i)
@@ -503,7 +696,7 @@ func (fc *FallbackChain) ChatStreamWithOptions(ctx context.Context, messages []M
 				if !fc.shouldTryNextProvider(i, err) {
 					return nil, err
 				}
-				log.Printf("[fallback] provider %s ChatStreamWithOptions failed: %v, trying next", p.Name(), err)
+				log.Printf("[fallback] %s ChatStreamWithOptions failed: %v, trying next", fc.nodeLabel(i), err)
 				continue
 			}
 			fc.recordSuccess(i)
@@ -517,7 +710,7 @@ func (fc *FallbackChain) ChatStreamWithOptions(ctx context.Context, messages []M
 			if !fc.shouldTryNextProvider(i, err) {
 				return nil, err
 			}
-			log.Printf("[fallback] provider %s ChatStream failed: %v, trying next", p.Name(), err)
+			log.Printf("[fallback] %s ChatStream failed: %v, trying next", fc.nodeLabel(i), err)
 			continue
 		}
 		fc.recordSuccess(i)

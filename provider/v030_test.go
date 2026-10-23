@@ -359,8 +359,8 @@ func TestFallbackChainDisablesModelNotFoundFallback(t *testing.T) {
 	registry.RegisterFactory("mock2", func(cfg Config) Provider { return fallback })
 
 	chain, _ := NewFallbackChain([]FallbackConfig{
-		{Name: "mock1", APIKey: "test", Model: "primary"},
-		{Name: "mock2", APIKey: "test", Model: "missing"},
+		{Name: "mock1", APIKey: "test", APIBase: "https://primary.example/v1", Model: "primary"},
+		{Name: "mock2", APIKey: "other", APIBase: "https://fallback.example/v1", Model: "missing"},
 	}, registry)
 	chain.maxFails = 1
 
@@ -368,21 +368,191 @@ func TestFallbackChainDisablesModelNotFoundFallback(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "model_not_found") {
 		t.Fatalf("expected preserved model_not_found error, got %v", err)
 	}
-	if !chain.disabled[1] {
-		t.Fatal("expected model-not-found fallback to be disabled")
+	if !chain.modelError[1] || chain.isAvailable(1) {
+		t.Fatal("expected model-not-found fallback to be cooling")
 	}
 
 	primary.chatErr = nil
 	chain.mu.Lock()
-	chain.cooldownAt[0] = time.Now().Add(-time.Second)
+	chain.cooldownAt[0] = chain.clock().Add(-time.Second)
 	chain.mu.Unlock()
 	resp, err := chain.Chat(context.Background(), []Message{{Role: "user", Content: "again"}})
 	if err != nil || resp.Model != "mock1" {
-		t.Fatalf("expected recovered primary without retrying disabled fallback, response=%v err=%v", resp, err)
+		t.Fatalf("expected recovered primary without retrying cooled fallback, response=%v err=%v", resp, err)
 	}
 	if fallback.chatCalls != 1 {
-		t.Fatalf("disabled fallback should not be called again, calls=%d", fallback.chatCalls)
+		t.Fatalf("cooled fallback should not be called again, calls=%d", fallback.chatCalls)
 	}
+}
+
+func TestFallbackChainModelErrorCoolsOnlyThatModel(t *testing.T) {
+	registry := NewRegistry()
+	missing := &mockProvider{name: "openai", chatErr: fmt.Errorf(`API error 404: {"error":{"message":"Model \"grok-4.7\" is not supported by any configured account in this group","type":"model_not_found"}}`)}
+	other := &mockProvider{name: "openai"}
+	registry.RegisterFactory("openai", func(cfg Config) Provider {
+		if cfg.LlmProvider.Model == "grok-4.7" {
+			return missing
+		}
+		return other
+	})
+
+	chain, err := NewFallbackChain([]FallbackConfig{
+		{Name: "openai", APIKey: "same-key", APIBase: "https://gateway.example/v1", Model: "grok-4.7"},
+		{Name: "openai", APIKey: "same-key", APIBase: "https://gateway.example/v1", Model: "claude"},
+	}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, err := chain.Chat(context.Background(), []Message{{Role: "user", Content: "hi"}})
+	if err != nil || resp.Model != "openai" || other.chatCalls != 1 {
+		t.Fatalf("response=%v err=%v otherCalls=%d", resp, err, other.chatCalls)
+	}
+	if chain.isAvailable(0) || !chain.modelError[0] {
+		t.Fatal("missing model should be cooling")
+	}
+	if missing.chatCalls != 1 {
+		t.Fatalf("missing model calls=%d", missing.chatCalls)
+	}
+
+	chain.mu.Lock()
+	chain.cooldownAt[0] = chain.clock().Add(-time.Second)
+	chain.mu.Unlock()
+	missing.chatErr = nil
+	if _, err := chain.Chat(context.Background(), []Message{{Role: "user", Content: "probe"}}); err != nil {
+		t.Fatal(err)
+	}
+	if missing.chatCalls != 2 || chain.modelError[0] {
+		t.Fatalf("expected one probe to clear cooldown, calls=%d modelError=%v", missing.chatCalls, chain.modelError[0])
+	}
+	status := chain.Status()
+	if status.Nodes[0].Credential == "same-key" || status.Nodes[0].Credential == "" {
+		t.Fatalf("credential label leaked or empty: %+v", status.Nodes[0])
+	}
+	if status.Nodes[0].Model != "grok-4.7" || status.Nodes[1].Model != "claude" {
+		t.Fatalf("status=%+v", status)
+	}
+}
+
+type statusProvider struct {
+	name, model, state string
+	failures           int
+	err                error
+	calls              int
+}
+
+func (p *statusProvider) Name() string                 { return p.name }
+func (p *statusProvider) Validate() error              { return nil }
+func (p *statusProvider) CircuitStatus() (string, int) { return p.state, p.failures }
+func (p *statusProvider) Chat(context.Context, []Message) (*Response, error) {
+	p.calls++
+	if p.err != nil {
+		return nil, p.err
+	}
+	return &Response{Content: "ok", Model: p.model}, nil
+}
+func (p *statusProvider) ChatStream(ctx context.Context, messages []Message) (<-chan StreamChunk, error) {
+	resp, err := p.Chat(ctx, messages)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan StreamChunk, 1)
+	ch <- StreamChunk{Content: resp.Content, Done: true, Model: resp.Model}
+	close(ch)
+	return ch, nil
+}
+
+func TestFallbackChainStatusIncludesNodeCircuit(t *testing.T) {
+	registry := NewRegistry()
+	primary := &statusProvider{name: "openai", model: "grok-4.7", state: "Open", failures: 5, err: fmt.Errorf("tls: handshake failure")}
+	other := &statusProvider{name: "openai", model: "claude", state: "Closed"}
+	registry.RegisterFactory("openai", func(cfg Config) Provider {
+		if cfg.LlmProvider.Model == "grok-4.7" {
+			return primary
+		}
+		return other
+	})
+	chain, err := NewFallbackChain([]FallbackConfig{
+		{Name: "openai", APIKey: "k", APIBase: "https://a.example/v1", Model: "grok-4.7"},
+		{Name: "openai", APIKey: "k2", APIBase: "https://b.example/v1", Model: "claude"},
+	}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp, err := chain.Chat(context.Background(), nil)
+	if err != nil || resp.Model != "claude" {
+		t.Fatalf("resp=%v err=%v", resp, err)
+	}
+	status := chain.Status()
+	if status.Nodes[0].CircuitState != "Open" || status.Nodes[0].CircuitFailures != 5 {
+		t.Fatalf("primary status=%+v", status.Nodes[0])
+	}
+	if status.Nodes[1].CircuitState != "Closed" || !status.Nodes[1].Available {
+		t.Fatalf("other status=%+v", status.Nodes[1])
+	}
+	if other.calls != 1 || primary.calls != 1 {
+		t.Fatalf("primary=%d other=%d", primary.calls, other.calls)
+	}
+}
+
+func TestFallbackChainSharedEndpointDoesNotSwitchOnTLS(t *testing.T) {
+	registry := NewRegistry()
+	primaryCalls := 0
+	fallbackCalls := 0
+	registry.RegisterFactory("openai", func(cfg Config) Provider {
+		return &countingProvider{name: "openai", model: cfg.LlmProvider.Model, onChat: func(model string) error {
+			if model == "grok-4.7" {
+				primaryCalls++
+				return fmt.Errorf("remote error: tls: handshake failure")
+			}
+			fallbackCalls++
+			return fmt.Errorf(`API error 404: {"error":{"type":"model_not_found"}}`)
+		}}
+	})
+	chain, err := NewFallbackChain([]FallbackConfig{
+		{Name: "openai", APIKey: "same", APIBase: "https://gateway.example/v1", Model: "grok-4.7"},
+		{Name: "openai", APIKey: "same", APIBase: "https://gateway.example/v1", Model: "grok-4.5"},
+	}, registry)
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain.maxFails = 3
+
+	_, err = chain.Chat(context.Background(), nil)
+	if err == nil || !strings.Contains(err.Error(), "tls") {
+		t.Fatalf("err=%v", err)
+	}
+	if primaryCalls != 1 || fallbackCalls != 0 {
+		t.Fatalf("primary=%d fallback=%d", primaryCalls, fallbackCalls)
+	}
+	if chain.failCounts[0] != 1 || chain.modelError[1] {
+		t.Fatalf("counts=%v modelError=%v", chain.failCounts, chain.modelError)
+	}
+}
+
+type countingProvider struct {
+	name   string
+	model  string
+	onChat func(model string) error
+}
+
+func (p *countingProvider) Name() string    { return p.name }
+func (p *countingProvider) Validate() error { return nil }
+func (p *countingProvider) Chat(context.Context, []Message) (*Response, error) {
+	if err := p.onChat(p.model); err != nil {
+		return nil, err
+	}
+	return &Response{Content: "ok", Model: p.model}, nil
+}
+func (p *countingProvider) ChatStream(ctx context.Context, messages []Message) (<-chan StreamChunk, error) {
+	resp, err := p.Chat(ctx, messages)
+	if err != nil {
+		return nil, err
+	}
+	ch := make(chan StreamChunk, 1)
+	ch <- StreamChunk{Content: resp.Content, Model: resp.Model, Done: true}
+	close(ch)
+	return ch, nil
 }
 
 func TestFallbackChainResetCooldown(t *testing.T) {
@@ -402,7 +572,7 @@ func TestFallbackChainResetCooldown(t *testing.T) {
 	// 手动设置冷却
 	chain.mu.Lock()
 	chain.failCounts[0] = 3
-	chain.disabled[0] = true
+	chain.modelError[0] = true
 	chain.cooldownAt[0] = time.Now().Add(10 * time.Minute)
 	chain.mu.Unlock()
 
@@ -415,8 +585,8 @@ func TestFallbackChainResetCooldown(t *testing.T) {
 	if !chain.isAvailable(0) {
 		t.Error("should be available after reset")
 	}
-	if chain.disabled[0] {
-		t.Error("provider should be re-enabled after reset")
+	if chain.modelError[0] {
+		t.Error("provider model cooldown should be cleared after reset")
 	}
 }
 
@@ -498,7 +668,7 @@ func TestFallbackChainOnSwitch(t *testing.T) {
 	if !s {
 		t.Error("expected onSwitch callback")
 	}
-	if fn != "mock1" || tn != "mock2" {
+	if !strings.Contains(fn, "mock1 model=test") || !strings.Contains(tn, "mock2 model=test") {
 		t.Errorf("expected switch from mock1 to mock2, got %s to %s", fn, tn)
 	}
 }
