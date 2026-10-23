@@ -10,7 +10,7 @@ require (
 	github.com/mattn/go-sqlite3 v1.14.42
 	github.com/modelcontextprotocol/go-sdk v1.8.0
 	github.com/stretchr/testify v1.11.1
-	github.com/yurika0211/aestus v0.0.0-20261017093339-9361afb4f42d
+	github.com/yurika0211/aestus v0.1.0
 	go.opentelemetry.io/otel v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace v1.43.0
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc v1.43.0
@@ -27,7 +27,7 @@ require (
 	github.com/jezek/xgb v1.3.1 // indirect
 	github.com/larksuite/oapi-sdk-go/v3 v3.11.0 // indirect
 	github.com/yuin/goldmark v1.3.5 // indirect
-	github.com/yurika0211/luckyagent-orchestrator v0.1.1-0.20261019181659-18ef78990cea // indirect
+	github.com/yurika0211/luckyagent-orchestrator v0.1.1 // indirect
 	golang.org/x/net v0.52.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260414002931-afd174a4e478 // indirect
