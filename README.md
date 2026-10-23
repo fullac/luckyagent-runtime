@@ -53,6 +53,9 @@ legacy config migration, reply reserve and complete tool-exchange trimming.
 schemas and the optional `models.endpoints.chat.prompt_cache_key`, including
 the independent per-fallback setting and both OpenAI protocols.
 
+[Provider fallback](docs/provider-fallback.md) describes model-level cooldown,
+shared-endpoint failures, per-node circuit breakers and the readiness check.
+
 ## Validation
 
 ```bash
