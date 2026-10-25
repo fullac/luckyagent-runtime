@@ -282,15 +282,25 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		return nil, fmt.Errorf("failed to decode response body: %w", err)
 	}
 
-	result := make([][]float64, len(respBody.Data))
+	result := make([][]float64, len(texts))
+	seen := make([]bool, len(texts))
 	for _, item := range respBody.Data {
-		if item.Index < 0 || item.Index >= len(result) {
+		if item.Index < 0 || item.Index >= len(texts) {
 			return nil, fmt.Errorf("embedding index out of range: %d", item.Index)
+		}
+		if seen[item.Index] {
+			return nil, fmt.Errorf("duplicate embedding index: %d", item.Index)
 		}
 		if len(item.Embedding) != dimension {
 			return nil, fmt.Errorf("embedding dimension mismatch for input %d: got %d, want %d", item.Index, len(item.Embedding), dimension)
 		}
 		result[item.Index] = item.Embedding
+		seen[item.Index] = true
+	}
+	for i, ok := range seen {
+		if !ok {
+			return nil, fmt.Errorf("missing embedding for input %d", i)
+		}
 	}
 
 	return result, nil

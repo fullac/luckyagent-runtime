@@ -107,6 +107,69 @@ func TestOpenAIEmbedder_EmbedBatchRejectsResponseDimensionMismatch(t *testing.T)
 	}
 }
 
+func TestOpenAIEmbedder_EmbedBatchRejectsIncompleteResponse(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, err := json.Marshal(embeddingResponse{
+			Data:   []embeddingData{{Index: 0, Embedding: []float64{0.1, 0.2}, Object: "embedding"}},
+			Model:  "text-embedding-ada-002",
+			Object: "list",
+		})
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+
+	emb := NewOpenAIEmbedder(OpenAIEmbedderConfig{
+		APIKey:    "test-key",
+		Model:     "text-embedding-ada-002",
+		BaseURL:   "https://example.test/v1",
+		Dimension: 2,
+	})
+	emb.client = client
+	_, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err == nil || !strings.Contains(err.Error(), "missing embedding for input 1") {
+		t.Fatalf("expected a missing response item error, got %v", err)
+	}
+}
+
+func TestOpenAIEmbedder_EmbedBatchRejectsDuplicateResponseIndex(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		body, err := json.Marshal(embeddingResponse{
+			Data: []embeddingData{
+				{Index: 0, Embedding: []float64{0.1, 0.2}, Object: "embedding"},
+				{Index: 0, Embedding: []float64{0.3, 0.4}, Object: "embedding"},
+			},
+			Model:  "text-embedding-ada-002",
+			Object: "list",
+		})
+		if err != nil {
+			t.Fatalf("marshal response: %v", err)
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     make(http.Header),
+			Body:       io.NopCloser(bytes.NewReader(body)),
+		}, nil
+	})}
+
+	emb := NewOpenAIEmbedder(OpenAIEmbedderConfig{
+		APIKey:    "test-key",
+		Model:     "text-embedding-ada-002",
+		BaseURL:   "https://example.test/v1",
+		Dimension: 2,
+	})
+	emb.client = client
+	_, err := emb.EmbedBatch(context.Background(), []string{"hello", "world"})
+	if err == nil || !strings.Contains(err.Error(), "duplicate embedding index: 0") {
+		t.Fatalf("expected a duplicate response index error, got %v", err)
+	}
+}
+
 func TestOpenAIEmbedder_EmbedBatchRequestsConfiguredV3Dimension(t *testing.T) {
 	const dimension = 1024
 	client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
