@@ -98,8 +98,9 @@ type OpenAIEmbedderConfig struct {
 }
 
 type embeddingRequest struct {
-	Model string   `json:"model"`
-	Input []string `json:"input"`
+	Model      string   `json:"model"`
+	Input      []string `json:"input"`
+	Dimensions int      `json:"dimensions,omitempty"`
 }
 
 type embeddingData struct {
@@ -131,24 +132,54 @@ const (
 
 // NewOpenAIEmbedder creates an OpenAI embedder.
 func NewOpenAIEmbedder(cfg OpenAIEmbedderConfig) *OpenAIEmbedder {
-	baseURL := cfg.BaseURL
+	baseURL := strings.TrimSpace(cfg.BaseURL)
 	if baseURL == "" {
 		baseURL = "https://api.openai.com/v1"
 	}
-	model := cfg.Model
+	if envURL := strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_URL")); envURL != "" &&
+		(strings.TrimSpace(cfg.BaseURL) == "" || baseURL == "https://api.openai.com/v1") {
+		baseURL = envURL
+	}
+
+	model := strings.TrimSpace(cfg.Model)
+	if envModel := strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_NAME")); envModel != "" &&
+		(model == "" || model == "text-embedding-3-small") {
+		model = envModel
+	}
 	if model == "" {
 		model = "text-embedding-3-small"
 	}
+
+	apiKey := strings.TrimSpace(cfg.APIKey)
+	if apiKey == "" {
+		apiKey = strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_KEY"))
+	}
+
 	dim := cfg.Dimension
+	if dim <= 0 {
+		dim = embeddingDimensionFromEnv()
+	}
 	if dim <= 0 {
 		dim = openAIDefaultDim(model)
 	}
 	return &OpenAIEmbedder{
-		apiKey:    cfg.APIKey,
+		apiKey:    apiKey,
 		model:     model,
 		baseURL:   baseURL,
 		dimension: dim,
 	}
+}
+
+func embeddingDimensionFromEnv() int {
+	raw := strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_DIMENSION"))
+	if raw == "" {
+		return 0
+	}
+	dim, err := strconv.Atoi(raw)
+	if err != nil || dim <= 0 {
+		return 0
+	}
+	return dim
 }
 
 func openAIDefaultDim(model string) int {
@@ -186,27 +217,13 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	}
 
 	modelName := strings.TrimSpace(o.model)
-	envModelName := strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_NAME"))
-	if envModelName != "" && (modelName == "" || modelName == "text-embedding-3-small") {
-		modelName = envModelName
-	} else if modelName == "" {
-		modelName = envModelName
-	}
 	if modelName == "" {
 		modelName = "text-embedding-3-small"
 	}
 
 	apiKey := strings.TrimSpace(o.apiKey)
-	if apiKey == "" {
-		apiKey = strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_KEY"))
-	}
 
 	baseURL := strings.TrimSpace(o.baseURL)
-	if baseURL == "" || baseURL == "https://api.openai.com/v1" {
-		if envURL := strings.TrimSpace(os.Getenv("EMBEDDING_MODEL_URL")); envURL != "" {
-			baseURL = envURL
-		}
-	}
 
 	dimension := o.dimension
 	if dimension <= 0 {
@@ -224,6 +241,9 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 	reqBody := embeddingRequest{
 		Model: modelName,
 		Input: texts,
+	}
+	if strings.HasPrefix(modelName, "text-embedding-3-") {
+		reqBody.Dimensions = dimension
 	}
 
 	data, err := jsonAPI.Marshal(reqBody)
@@ -262,12 +282,25 @@ func (o *OpenAIEmbedder) EmbedBatch(ctx context.Context, texts []string) ([][]fl
 		return nil, fmt.Errorf("failed to decode response body: %w", err)
 	}
 
-	result := make([][]float64, len(respBody.Data))
+	result := make([][]float64, len(texts))
+	seen := make([]bool, len(texts))
 	for _, item := range respBody.Data {
-		if item.Index < 0 || item.Index >= len(result) {
+		if item.Index < 0 || item.Index >= len(texts) {
 			return nil, fmt.Errorf("embedding index out of range: %d", item.Index)
 		}
+		if seen[item.Index] {
+			return nil, fmt.Errorf("duplicate embedding index: %d", item.Index)
+		}
+		if len(item.Embedding) != dimension {
+			return nil, fmt.Errorf("embedding dimension mismatch for input %d: got %d, want %d", item.Index, len(item.Embedding), dimension)
+		}
 		result[item.Index] = item.Embedding
+		seen[item.Index] = true
+	}
+	for i, ok := range seen {
+		if !ok {
+			return nil, fmt.Errorf("missing embedding for input %d", i)
+		}
 	}
 
 	return result, nil
