@@ -25,7 +25,8 @@ API and gateway modules.
 
 [Session storage and recovery](docs/session-storage.md) covers concurrent
 saves, deletion, standalone backups, incomplete JSONL tails, metadata-only
-updates and bounded history pagination.
+updates, bounded history pagination and optional user-facing recap metadata
+with stale-write protection. Recap generation belongs to the Agent.
 
 ## Resource lifecycle
 
