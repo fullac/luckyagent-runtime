@@ -1,5 +1,19 @@
 # Session storage and recovery
 
+## User-facing recaps
+
+Optional `recap` and `recap_updated_at` metadata contain the Agent-generated
+one-sentence preview. They are separate from titles, compact summaries, memory
+and RAG. Old sessions omit both fields. List/search and cold session handles
+read the stored preview without loading history; sidecars remain authoritative
+and the SQLite catalog migrates automatically, including existing databases.
+
+`RecapSnapshot` captures recent transcript evidence with an update timestamp.
+`UpdateRecap` only accepts a nonempty result for that same live session version;
+late results after a new message or deletion are discarded. Failed writes keep
+the previous preview. Recap writes do not change `updated_at`, title or messages.
+No configuration keys are added.
+
 The `session` package owns durable conversation history. Sessions retain the
 existing metadata sidecars, `segment_v1` JSONL messages, external bodies and
 legacy Markdown migration. No new configuration fields are required.

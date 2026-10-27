@@ -65,7 +65,39 @@ func (idx *sessionIndex) init() error {
 		);
 		CREATE INDEX IF NOT EXISTS idx_sessions_list ON sessions(pinned, updated_at);
 	`)
-	return err
+	if err != nil {
+		return err
+	}
+	// Upgrade existing derived catalogs without touching transcripts. Old rows
+	// default to an absent recap and remain valid until the next metadata write.
+	rows, err := idx.db.Query("PRAGMA table_info(sessions)")
+	if err != nil {
+		return err
+	}
+	columns := map[string]bool{}
+	for rows.Next() {
+		var cid, notNull, pk int
+		var name, typ string
+		var defaultValue any
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &defaultValue, &pk); err != nil {
+			rows.Close()
+			return err
+		}
+		columns[name] = true
+	}
+	err = rows.Err()
+	rows.Close()
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"recap", "recap_updated_at"} {
+		if !columns[name] {
+			if _, err := idx.db.Exec("ALTER TABLE sessions ADD COLUMN " + name + " TEXT NOT NULL DEFAULT ''"); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 func (idx *sessionIndex) Close() error {
@@ -82,7 +114,7 @@ func (idx *sessionIndex) List() (map[string]indexedSession, error) {
 	rows, err := idx.db.Query(`
 		SELECT id, title, agent_role, agent_system_prompt, pinned, project, message_count,
 			created_at, updated_at, byte_size, format, shell_context,
-			source_size, source_mtime_ns, tail_offset, file_size
+			source_size, source_mtime_ns, tail_offset, file_size, recap, recap_updated_at
 		FROM sessions`)
 	if err != nil {
 		return nil, err
@@ -92,19 +124,23 @@ func (idx *sessionIndex) List() (map[string]indexedSession, error) {
 	for rows.Next() {
 		var row indexedSession
 		var pinned int
-		var created, updated, shell string
+		var created, updated, shell, recapUpdated string
 		var sourceMTime int64
 		if err := rows.Scan(
 			&row.Meta.ID, &row.Meta.Title, &row.Meta.AgentRole, &row.Meta.AgentSystemPrompt,
 			&pinned, &row.Meta.Project, &row.Meta.MessageCount, &created, &updated,
 			&row.Meta.ByteSize, &row.Meta.Format, &shell,
 			&row.SourceSize, &sourceMTime, &row.TailOffset, &row.FileSize,
+			&row.Meta.Recap, &recapUpdated,
 		); err != nil {
 			return nil, err
 		}
 		row.Meta.Pinned = pinned != 0
 		row.Meta.CreatedAt, _ = time.Parse(time.RFC3339Nano, created)
 		row.Meta.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updated)
+		if at, err := time.Parse(time.RFC3339Nano, recapUpdated); err == nil {
+			row.Meta.RecapUpdatedAt = &at
+		}
 		_ = json.Unmarshal([]byte(shell), &row.Meta.ShellContext)
 		row.SourceTime = time.Unix(0, sourceMTime)
 		out[row.Meta.ID] = row
@@ -124,14 +160,20 @@ func (idx *sessionIndex) Upsert(row indexedSession) error {
 	if row.Meta.Pinned {
 		pinned = 1
 	}
+	recapUpdated := ""
+	if row.Meta.RecapUpdatedAt != nil {
+		recapUpdated = row.Meta.RecapUpdatedAt.UTC().Format(time.RFC3339Nano)
+	}
 	_, err = idx.db.Exec(`
 		INSERT INTO sessions (
 			id, title, agent_role, agent_system_prompt, pinned, project, message_count,
 			created_at, updated_at, byte_size, format, shell_context,
-			source_size, source_mtime_ns, tail_offset, file_size
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			source_size, source_mtime_ns, tail_offset, file_size, recap, recap_updated_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			title = excluded.title,
+			recap = excluded.recap,
+			recap_updated_at = excluded.recap_updated_at,
 			agent_role = excluded.agent_role,
 			agent_system_prompt = excluded.agent_system_prompt,
 			pinned = excluded.pinned,
@@ -151,7 +193,7 @@ func (idx *sessionIndex) Upsert(row indexedSession) error {
 		row.Meta.CreatedAt.UTC().Format(time.RFC3339Nano),
 		row.Meta.UpdatedAt.UTC().Format(time.RFC3339Nano),
 		row.Meta.ByteSize, row.Meta.Format, string(shell),
-		row.SourceSize, row.SourceTime.UnixNano(), row.TailOffset, row.FileSize)
+		row.SourceSize, row.SourceTime.UnixNano(), row.TailOffset, row.FileSize, row.Meta.Recap, recapUpdated)
 	return err
 }
 

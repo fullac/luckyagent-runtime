@@ -64,10 +64,12 @@ type Session struct {
 	mu sync.RWMutex
 	// saveMu serializes transcript mutations, persistence and deletion. Acquire
 	// it before loadMu or mu; callers already holding it use the *Locked helpers.
-	saveMu sync.Mutex
-	loadMu sync.Mutex
-	ID     string
-	Title  string
+	saveMu         sync.Mutex
+	loadMu         sync.Mutex
+	ID             string
+	Title          string
+	recap          string
+	recapUpdatedAt *time.Time
 	// AgentRole and AgentSystemPrompt identify a runtime-owned worker or
 	// sub-agent session and survive process restarts with the session metadata.
 	AgentRole         string
@@ -861,6 +863,7 @@ func (s *Session) saveLocked() error {
 	// lifecycle lock keeps the prefix stable while disk I/O runs without mu.
 	messages := append([]provider.Message(nil), s.Messages[start:]...)
 	title := s.Title
+	recap, recapUpdatedAt := s.recap, s.recapUpdatedAt
 	agentRole := s.AgentRole
 	agentSystemPrompt := s.AgentSystemPrompt
 	pinned := s.Pinned
@@ -925,6 +928,8 @@ func (s *Session) saveLocked() error {
 	meta := sessionMetadata{
 		ID:                id,
 		Title:             title,
+		Recap:             recap,
+		RecapUpdatedAt:    recapUpdatedAt,
 		AgentRole:         agentRole,
 		AgentSystemPrompt: agentSystemPrompt,
 		Pinned:            pinned,
@@ -1018,6 +1023,8 @@ type sessionData struct {
 }
 
 type sessionMetadata struct {
+	Recap             string       `json:"recap,omitempty"`
+	RecapUpdatedAt    *time.Time   `json:"recap_updated_at,omitempty"`
 	ID                string       `json:"id"`
 	Title             string       `json:"title"`
 	AgentRole         string       `json:"agent_role,omitempty"`
@@ -1296,6 +1303,8 @@ func (m *Manager) newSessionStub(meta sessionMetadata, format string) *Session {
 	return &Session{
 		ID:                meta.ID,
 		Title:             meta.Title,
+		recap:             meta.Recap,
+		recapUpdatedAt:    meta.RecapUpdatedAt,
 		AgentRole:         meta.AgentRole,
 		AgentSystemPrompt: meta.AgentSystemPrompt,
 		Pinned:            meta.Pinned,
@@ -1758,18 +1767,21 @@ func (m *Manager) ListInfo() []SessionInfo {
 		}
 		id, title, agentRole, pinned, project, count := s.ID, s.Title, s.AgentRole, s.Pinned, s.Project, s.messageCountLocked()
 		created, updated, byteSize := s.CreatedAt, s.UpdatedAt, s.storageBytes
+		recap, recapUpdatedAt := s.recap, cloneRecapTime(s.recapUpdatedAt)
 		s.mu.RUnlock()
 		infos = append(infos, SessionInfo{
-			ID:           id,
-			Title:        title,
-			AgentRole:    agentRole,
-			Pinned:       pinned,
-			Project:      project,
-			MessageCount: count,
-			ByteSize:     byteSize,
-			Format:       format,
-			CreatedAt:    created,
-			UpdatedAt:    updated,
+			ID:             id,
+			Title:          title,
+			Recap:          recap,
+			RecapUpdatedAt: recapUpdatedAt,
+			AgentRole:      agentRole,
+			Pinned:         pinned,
+			Project:        project,
+			MessageCount:   count,
+			ByteSize:       byteSize,
+			Format:         format,
+			CreatedAt:      created,
+			UpdatedAt:      updated,
 		})
 	}
 
@@ -1829,14 +1841,16 @@ func (m *Manager) Search(query string) []SessionInfo {
 	for _, s := range m.sessions {
 		s.mu.RLock()
 		info := SessionInfo{
-			ID:           s.ID,
-			Title:        s.Title,
-			AgentRole:    s.AgentRole,
-			Pinned:       s.Pinned,
-			Project:      s.Project,
-			MessageCount: s.messageCountLocked(),
-			CreatedAt:    s.CreatedAt,
-			UpdatedAt:    s.UpdatedAt,
+			ID:             s.ID,
+			Title:          s.Title,
+			Recap:          s.recap,
+			RecapUpdatedAt: cloneRecapTime(s.recapUpdatedAt),
+			AgentRole:      s.AgentRole,
+			Pinned:         s.Pinned,
+			Project:        s.Project,
+			MessageCount:   s.messageCountLocked(),
+			CreatedAt:      s.CreatedAt,
+			UpdatedAt:      s.UpdatedAt,
 		}
 		loaded := s.messagesLoaded
 		messages := append([]provider.Message(nil), s.Messages...)

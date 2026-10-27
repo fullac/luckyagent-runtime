@@ -10,16 +10,18 @@ import (
 )
 
 type SessionInfo struct {
-	ID           string    `json:"id"`
-	Title        string    `json:"title"`
-	AgentRole    string    `json:"agent_role,omitempty"`
-	Pinned       bool      `json:"pinned,omitempty"`
-	Project      string    `json:"project,omitempty"`
-	MessageCount int       `json:"message_count"`
-	ByteSize     int64     `json:"byte_size,omitempty"`
-	Format       string    `json:"format,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	ID             string     `json:"id"`
+	Title          string     `json:"title"`
+	Recap          string     `json:"recap,omitempty"`
+	RecapUpdatedAt *time.Time `json:"recap_updated_at,omitempty"`
+	AgentRole      string     `json:"agent_role,omitempty"`
+	Pinned         bool       `json:"pinned,omitempty"`
+	Project        string     `json:"project,omitempty"`
+	MessageCount   int        `json:"message_count"`
+	ByteSize       int64      `json:"byte_size,omitempty"`
+	Format         string     `json:"format,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 }
 
 // S is the caller's session handle, normally a pointer. The zero value denotes
