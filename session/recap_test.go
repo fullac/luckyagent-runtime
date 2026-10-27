@@ -127,3 +127,16 @@ func TestRecapOptionalAndIndexMigration(t *testing.T) {
 		t.Fatal(rows, err)
 	}
 }
+
+func TestRecapSnapshotPreservesUserOutsideToolTail(t *testing.T) {
+	s := NewSession("long-turn", t.TempDir())
+	s.AddMessage("user", "修复代码")
+	for range 80 {
+		s.AddMessage("tool", "tool result")
+	}
+	s.AddMessage("assistant", "完成")
+	_, messages, _, err := s.RecapSnapshot(64)
+	if err != nil || len(messages) != 65 || messages[0].Content != "修复代码" || messages[64].Content != "完成" {
+		t.Fatalf("snapshot: %d messages, %v", len(messages), err)
+	}
+}

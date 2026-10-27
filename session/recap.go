@@ -42,7 +42,18 @@ func (s *Session) RecapSnapshot(limit int) (string, []provider.Message, time.Tim
 	if limit > 0 && len(s.Messages) > limit {
 		start = len(s.Messages) - limit
 	}
-	return s.recap, append([]provider.Message(nil), s.Messages[start:]...), s.UpdatedAt, nil
+	messages := append([]provider.Message(nil), s.Messages[start:]...)
+	// A long tool loop can push the user's request outside the bounded tail.
+	// Retain that request so generation still knows the task and its language.
+	for i := len(s.Messages) - 1; i >= 0; i-- {
+		if s.Messages[i].Role == "user" {
+			if i < start {
+				messages = append([]provider.Message{s.Messages[i]}, messages...)
+			}
+			break
+		}
+	}
+	return s.recap, messages, s.UpdatedAt, nil
 }
 
 // UpdateRecap persists a generated preview only while its source is current.
